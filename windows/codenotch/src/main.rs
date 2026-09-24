@@ -40,7 +40,7 @@ pub const NOTCH_W: f64 = 360.0;
 /// A simple 360×700 rotation clipped the bottom of cards because the card begins beyond the body.
 pub const HORIZONTAL_NOTCH_H: f64 = 700.0;
 /// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r42-hover-menu-hotfix";
+pub const BUILD: &str = "r43-grok-click-parity";
 // The macOS geometry is 526 pt tall for five provider cells before a hover card is considered.
 // 700 leaves the same end slack the native panel keeps, so the first/last card can stay wholly on
 // screen without shrinking the rings or folding the spacing back toward the old Windows design.

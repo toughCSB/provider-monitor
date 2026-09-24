@@ -13,6 +13,7 @@ SCHEME  := ProviderMonitor
 RESOLVED_PACKAGES := $(PROJECT)/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 ARCH    ?= $(shell uname -m)
 DEST    ?= platform=macOS,arch=$(ARCH)
+TEST_DERIVED := $(CURDIR)/build/TestDerivedData.noindex
 
 # Debug signs itself when the maintainer's Developer ID certificate isn't in
 # the keychain, which is every machine but the maintainer's — so a contributor
@@ -68,16 +69,22 @@ build: gen
 		-configuration Debug $(DEV_SIGN) build
 
 test: gen
-	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
-		-configuration Debug $(DEV_SIGN) test
+	@status=0; xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
+		-derivedDataPath '$(TEST_DERIVED)' -configuration Debug $(DEV_SIGN) test || status=$$?; \
+	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+		-u '$(TEST_DERIVED)/Build/Products/Debug/Provider Monitor.app' 2>/dev/null || true; \
+	exit $$status
 
 # Continuous integration: no Developer ID identity exists on a CI runner, and
 # unit tests need none — override the manual signing with plain unsigned
 # builds rather than asking every contributor to hold a certificate.
 test-ci: gen
-	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
-		-configuration Debug test \
-		CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+	@status=0; xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
+		-derivedDataPath '$(TEST_DERIVED)' -configuration Debug test \
+		CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO || status=$$?; \
+	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+		-u '$(TEST_DERIVED)/Build/Products/Debug/Provider Monitor.app' 2>/dev/null || true; \
+	exit $$status
 
 verify-deps:
 	rm -rf $(PROJECT)
@@ -88,12 +95,10 @@ verify-deps:
 		exit 1; \
 	}
 
-run: build
-	@APP="$$(xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
-		-configuration Debug -showBuildSettings 2>/dev/null \
-		| awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $$2; exit}')/$(APP_BUNDLE)"; \
-	pkill -x "$(APP_PROCESS)" 2>/dev/null; sleep 0.5; \
-	open "$$APP"
+# Never open an app bundle from DerivedData: macOS registers that path as a
+# separate installed app and shows duplicate Provider Monitor icons. `install`
+# launches only the canonical /Applications copy.
+run: install
 
 # Build a Release .app, sign it with whatever identity is available (Developer
 # ID, Apple Development, or ad-hoc — the same auto-detection as `DEV_SIGN`),

@@ -55,9 +55,9 @@
 
 ## 릴리스
 
-한 릴리스에 두 플랫폼이 함께 실립니다. 같은 `v1.17.1` 태그에 macOS dmg와 Windows 설치 프로그램이 같이 붙습니다.
+한 릴리스에 두 플랫폼이 함께 실립니다. 같은 `v1.17.2` 태그에 macOS dmg와 Windows 설치 프로그램이 같이 붙습니다.
 
-- **macOS** — [ProviderMonitor-1.17.1-unsigned.dmg](../../releases/download/v1.17.1/ProviderMonitor-1.17.1-unsigned.dmg) · 유니버설(Apple Silicon + Intel), macOS 15 이상
+- **macOS** — [ProviderMonitor-1.17.2-unsigned.dmg](../../releases/download/v1.17.2/ProviderMonitor-1.17.2-unsigned.dmg) · 유니버설(Apple Silicon + Intel), macOS 15 이상
 - **Windows** — [Provider-Monitor-Setup.exe](../../releases/latest/download/Provider-Monitor-Setup.exe) · Windows 11 (WebView2 런타임 기본 포함)
 
 `main`의 최신 커밋을 바로 써보려면 [preview 릴리스](../../releases/tag/preview)에 push마다 새 dmg가 올라옵니다.

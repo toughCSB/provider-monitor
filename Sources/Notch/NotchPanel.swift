@@ -11,7 +11,7 @@ final class NotchPanel: NSPanel {
     var contextMenuProvider: (() -> NSMenu?)?
     /// A left click on the visible chrome. Handled here for the same reason the
     /// menu is: the hit test lands on a SwiftUI subview that may consume it.
-    var onClick: ((CGPoint) -> Void)?
+    var onClick: ((CGPoint, Int) -> Void)?
     /// Whether a plain press at this point may slide the notch. The press is
     /// still only *allowed* to become a drag: whether it does is decided by
     /// `PressGesture` below. Nil means anywhere.
@@ -52,7 +52,7 @@ final class NotchPanel: NSPanel {
         let options = event.modifierFlags.contains(.option)
         let mayDrag = onDrag != nil && (options || (canDragAt?(event.locationInWindow) ?? true))
         guard mayDrag else {
-            onClick?(event.locationInWindow)
+            onClick?(event.locationInWindow, event.clickCount)
             return
         }
         trackDrag(from: event, immediate: options)
@@ -88,7 +88,7 @@ final class NotchPanel: NSPanel {
                 if gesture.dragged(dx: dx, dy: dy) { onDragStart?() }
                 if gesture.isDragging { onDrag?(dx, dy) }
             case .leftMouseUp:
-                if gesture.isDragging { onDragEnd?() } else { onClick?(event.locationInWindow) }
+                if gesture.isDragging { onDragEnd?() } else { onClick?(event.locationInWindow, event.clickCount) }
                 return
             default:
                 break
@@ -96,7 +96,7 @@ final class NotchPanel: NSPanel {
         }
         // The stream ran dry without a release — nothing more is coming, so the
         // press is settled as the click it looked like.
-        if gesture.isDragging { onDragEnd?() } else { onClick?(event.locationInWindow) }
+        if gesture.isDragging { onDragEnd?() } else { onClick?(event.locationInWindow, event.clickCount) }
     }
 
     /// The window's own queue in the app; nothing at all under test, where

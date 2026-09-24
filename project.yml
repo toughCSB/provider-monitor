@@ -13,8 +13,8 @@ settings:
     # The GitHub release updater compares MARKETING_VERSION, while macOS also
     # uses CURRENT_PROJECT_VERSION as the monotonically increasing build number.
     # Bump both on every release.
-    MARKETING_VERSION: "1.17.1"
-    CURRENT_PROJECT_VERSION: "22"
+    MARKETING_VERSION: "1.17.2"
+    CURRENT_PROJECT_VERSION: "23"
     # Signed with a stable identity on purpose. The app reads Claude Code's
     # OAuth token out of the login keychain, and the keychain's ACL remembers
     # *which signed binary* was allowed. Ad-hoc or unsigned builds get a new
@@ -86,6 +86,10 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.toughcsb.providermonitor
+        # Xcode otherwise registers every Debug/Release bundle in DerivedData
+        # as another installed app. Only the canonical /Applications copy
+        # should appear in app search and LaunchServices.
+        REGISTER_WITH_LAUNCH_SERVICES: "NO"
         # What Finder, the Dock and the menu bar show. The module stays one
         # word so `import` and `@testable import` are not spelled with an
         # underscore.

@@ -24,6 +24,10 @@ final class NotchWindowController {
     var onToggleKeepOpen: (() -> Void)?
     /// Refetch a single provider, asked for by clicking its ring.
     var onRefreshProvider: ((String) async -> Void)?
+    /// Overridable so click tests can observe navigation without opening a browser.
+    var openProviderPage: (URL) -> Void = { NSWorkspace.shared.open($0) }
+    private var pendingProviderClick: DispatchWorkItem?
+    var providerClickDelay: TimeInterval = NSEvent.doubleClickInterval
     /// Open the settings window, asked for by clicking the handle.
     var onOpenSettings: (() -> Void)?
     /// Flip whether the notch floats above other applications' windows. The
@@ -297,6 +301,8 @@ final class NotchWindowController {
     }
 
     func stop() {
+        pendingProviderClick?.cancel()
+        pendingProviderClick = nil
         setPointing(false)
         peekUntil = nil
         peekWork?.cancel()
@@ -369,7 +375,7 @@ final class NotchWindowController {
             )
             let hosting = NotchHostingView(rootView: NotchRootView(model: model))
             panel.contextMenuProvider = { [weak self] in self?.contextMenu() }
-            panel.onClick = { [weak self] point in self?.handleClick(at: point) }
+            panel.onClick = { [weak self] point, count in self?.handleClick(at: point, clickCount: count) }
             panel.onDragStart = { [weak self] in self?.beginNotchDrag() }
             panel.onDrag = { [weak self] dx, dy in self?.dragged(dx: dx, dy: dy) }
             panel.onDragEnd = { [weak self] in
@@ -765,7 +771,7 @@ final class NotchWindowController {
 
     /// A click on a ring refetches that provider; a click anywhere else on the
     /// open notch pins it. The ring is the more specific target, so it wins.
-    func handleClick(at locationInWindow: CGPoint) {
+    func handleClick(at locationInWindow: CGPoint, clickCount: Int = 1) {
         guard let panel else {
             setExpanded(true)
             return
@@ -815,13 +821,46 @@ final class NotchWindowController {
         if notchRect.contains(local),
            let index = cellIndex(along: placement.along(of: local)),
            model.snapshots.indices.contains(index) {
-            if let onRefreshProvider {
-                let snapshot = model.snapshots[index]
-                Task { await model.refresh(snapshot, using: onRefreshProvider) }
-            }
+            activateCell(model.snapshots[index], clickCount: clickCount)
             return
         }
         togglePinned()
+    }
+
+    /// Delay the first click until AppKit's double-click window closes. Its second
+    /// mouseDown carries clickCount=2, so a double click never starts a fetch.
+    func activateCell(_ snapshot: ProviderSnapshot, clickCount: Int) {
+        pendingProviderClick?.cancel()
+        pendingProviderClick = nil
+        if clickCount >= 2 {
+            if let url = Self.providerPage(for: snapshot.providerID) { openProviderPage(url) }
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let onRefreshProvider = self.onRefreshProvider else { return }
+            Task { await self.model.refresh(snapshot, using: onRefreshProvider) }
+            self.pendingProviderClick = nil
+        }
+        pendingProviderClick = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + providerClickDelay, execute: work)
+    }
+
+    static func providerPage(for id: String) -> URL? {
+        let pages = [
+            "codex": "https://chatgpt.com/codex/cloud/settings/analytics#usage",
+            "claude": "https://claude.ai/settings/usage",
+            "gemini": "https://gemini.google.com/app",
+            "grok": "https://grok.com/?_s=usage",
+            "opencode": "https://opencode.ai/workspace/wrk_01M02ADN1RXR7S9P9S5BYPPAGT/go",
+            "cursor": "https://cursor.com/dashboard",
+            "glm": "https://bigmodel.cn/usercenter/proj-mgmt/apikeys",
+            "devin": "https://app.devin.ai",
+            "commandcode": "https://commandcode.ai",
+            "kimi": "https://www.kimi.com/code/console",
+            "copilot": "https://github.com/settings/copilot",
+            "kiro": "https://kiro.dev",
+        ]
+        return pages[id].flatMap(URL.init(string:))
     }
 
     /// Move the notch to another screen edge.
@@ -1110,6 +1149,8 @@ final class NotchWindowController {
     /// monitors — a retired controller that kept polling would relocate
     /// another display's panel underneath a parked pointer.
     func retire() {
+        pendingProviderClick?.cancel()
+        pendingProviderClick = nil
         apply(.hidden)
         stop()
     }

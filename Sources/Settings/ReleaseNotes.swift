@@ -32,6 +32,24 @@ enum ReleaseNotes {
     static var all: [ReleaseNote] {
         [
             ReleaseNote(
+                version: "1.17.2",
+                headline: L10n.t("Grok readings stay visible, and provider clicks behave alike on Mac and Windows."),
+                changes: [
+                    ReleaseNote.Change(
+                        title: L10n.t("Grok keeps its last reading during sign-in trouble"),
+                        detail: L10n.t("Windows marks an older Grok percentage as stale, retries after sign-in, and recognises a token rotated by Grok Build.")
+                    ),
+                    ReleaseNote.Change(
+                        title: L10n.t("Mac double-click opens the provider page"),
+                        detail: L10n.t("One click refreshes a provider; two clicks open its configured usage or workspace page without an extra refresh.")
+                    ),
+                    ReleaseNote.Change(
+                        title: L10n.t("Windows refresh shows feedback"),
+                        detail: L10n.t("A click on a provider ring now shows a refresh animation until its new reading arrives.")
+                    ),
+                ]
+            ),
+            ReleaseNote(
                 version: "1.17.1",
                 headline: L10n.t("Cards stay readable, Windows menus answer, and the Mac updates Provider Monitor."),
                 changes: [

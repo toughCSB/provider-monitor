@@ -796,6 +796,79 @@ final class StrayClickPinTests: XCTestCase {
     }
 }
 
+@MainActor
+final class NotchProviderClickTests: XCTestCase {
+    private func snapshot(_ id: String = "grok") -> ProviderSnapshot {
+        ProviderSnapshot(id: id, displayName: id, glyph: .grok,
+                         fidelity: .official, status: .ok,
+                         windows: [LimitWindow(id: "credits", label: "Weekly", usedFraction: 0.2)],
+                         headlineID: "credits")
+    }
+
+    func testDoubleClickOpensGrokWithoutRefreshing() async {
+        let controller = NotchWindowController()
+        var refreshes = 0
+        var opened: URL?
+        controller.onRefreshProvider = { _ in refreshes += 1 }
+        controller.openProviderPage = { opened = $0 }
+        controller.activateCell(snapshot(), clickCount: 1)
+        controller.activateCell(snapshot(), clickCount: 2)
+        try? await Task.sleep(nanoseconds: 650_000_000)
+        XCTAssertEqual(opened?.absoluteString, "https://grok.com/?_s=usage")
+        XCTAssertEqual(refreshes, 0)
+    }
+
+    func testSingleClickRefreshesOnlyItsProvider() async {
+        let controller = NotchWindowController()
+        var refreshed: [String] = []
+        var opened: URL?
+        controller.onRefreshProvider = { refreshed.append($0) }
+        controller.openProviderPage = { opened = $0 }
+        controller.activateCell(snapshot("codex"), clickCount: 1)
+        try? await Task.sleep(nanoseconds: 650_000_000)
+        XCTAssertEqual(refreshed, ["codex"])
+        XCTAssertNil(opened)
+    }
+
+    func testRequestedProviderPages() {
+        XCTAssertEqual(NotchWindowController.providerPage(for: "codex")?.absoluteString,
+                       "https://chatgpt.com/codex/cloud/settings/analytics#usage")
+        XCTAssertEqual(NotchWindowController.providerPage(for: "gemini")?.absoluteString,
+                       "https://gemini.google.com/app")
+        XCTAssertEqual(NotchWindowController.providerPage(for: "opencode")?.absoluteString,
+                       "https://opencode.ai/workspace/wrk_01M02ADN1RXR7S9P9S5BYPPAGT/go")
+    }
+
+    func testPanelDoubleClickUsesAppKitClickCount() async throws {
+        guard !NSScreen.screens.isEmpty else { throw XCTSkip("Requires a display") }
+        let controller = NotchWindowController()
+        controller.model.updateSnapshots([snapshot()])
+        controller.model.isExpanded = true
+        controller.relocate()
+        defer { controller.stop() }
+        let panel = try XCTUnwrap(controller.panelContentViewForTesting?.window as? NotchPanel)
+        let model = controller.model
+        let point = NotchPlacement(edge: model.edge, panelSize: panel.frame.size).point(
+            along: model.slack + model.ringCenter(index: 0) * model.sizeScale,
+            across: (model.contentInset + NotchLayout.bodyDepth(for: model.edge) / 2) * model.sizeScale)
+        let location = CGPoint(x: point.x, y: panel.frame.height - point.y)
+        var opened: URL?
+        var refreshed = 0
+        controller.openProviderPage = { opened = $0 }
+        controller.onRefreshProvider = { _ in refreshed += 1 }
+        for count in [1, 2] {
+            let event = try XCTUnwrap(NSEvent.mouseEvent(with: .leftMouseDown,
+                location: location, modifierFlags: [], timestamp: 0,
+                windowNumber: panel.windowNumber, context: nil,
+                eventNumber: count, clickCount: count, pressure: 1))
+            panel.mouseDown(with: event)
+        }
+        try? await Task.sleep(nanoseconds: 650_000_000)
+        XCTAssertEqual(opened?.absoluteString, "https://grok.com/?_s=usage")
+        XCTAssertEqual(refreshed, 0)
+    }
+}
+
 /// A ring dimmed the instant the very first idle refresh attempt failed,
 /// because `staleAfter` and `idleRefreshInterval` were the same value — so a
 /// reading was *guaranteed* to reach the dimming threshold before an idle

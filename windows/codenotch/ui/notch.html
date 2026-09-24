@@ -85,6 +85,10 @@
   /* Session arc animation */
   @keyframes spin{to{transform:rotate(360deg)}}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  .cell.is-pending svg.ring{transform:scale(.94);transform-origin:center;filter:brightness(1.4)}
+  .cell.is-refreshing svg.ring{animation:spin .8s linear infinite;transform-origin:center}
+  .cell.is-refreshing .pct{animation:pulse .8s ease-in-out infinite}
+  @media (prefers-reduced-motion:reduce){.cell.is-refreshing svg.ring,.cell.is-refreshing .pct{animation:none}.cell.is-refreshing .pct{opacity:.55}}
   /* A 60 fps SVG transform animation in a transparent always-on-top window slows the whole desktop
      compositor (other apps stutter). steps() drops repaints to ~10 fps; it still reads as spinning/breathing. */
   .arc-spin{animation:spin 1.2s steps(12) infinite;transform-origin:center}
@@ -605,7 +609,7 @@ function renderRing(){
     }
     svg.innerHTML=inner;
     if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
-    else if(h) pct.textContent=(h.derived?'~':'')+pctText(ringPercent(h))+'%';
+    else if(h) pct.textContent=((h.derived||(p.id==='grok'&&staleOf(p.snap)))?'~':'')+pctText(ringPercent(h))+'%';
     else pct.textContent=p.snap.windows.length?'—':'…'; // its declared window is missing: a dash, not a wait
     glyph.classList.toggle('dim', !!(h && h.used>=1));
     // A stale reading dims only what went stale: the arcs and track. The provider mark is still
@@ -716,6 +720,8 @@ function renderCard(){
   if(snap.status==='needsAuth'){
     const who={claude:'Sign in to Claude Code to see usage.',cursor:'Sign in to Cursor to see usage.',codex:'Sign in to Codex to see usage.',gemini:'Sign in to Antigravity to see usage.',grok:'Sign in to Grok to see usage.',opencode:'Sign in to OpenCode to see usage.',glm:'Sign in to GLM Code to see usage.',devin:'Sign in to Devin to see usage.',commandcode:'Sign in to Command Code to see usage.',kimi:'Sign in to Kimi Code to see usage.',copilot:'Sign in to GitHub Copilot to see usage.',kiro:'Sign in to Kiro to see usage.'}[p.id]||'';
     html+=`<div class="c-note">${textCopy(who)}<br>${esc(textCopy(snap.note||''))}</div>`;
+  }else if(snap.status==='stale'&&snap.note&&p.id==='grok'){
+    html+=`<div class="c-note">${esc(textCopy(snap.note))}</div>`;
   }else if(!snap.windows.length){
     html+=`<div class="c-note">${esc(textCopy(snap.note||'Waiting for first reading…'))}</div>`;
   }else{
@@ -1029,6 +1035,23 @@ listen('state',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()
    provider; a double click opens its official usage page. The short delay is necessary because a
    browser reports the first click before it knows a second one is coming. */
 let press=null, dragging=false, providerClickTimer=null, lastClickProvider=null, providerClickDelay=550;
+const refreshFeedback=new Map();
+function startRefreshFeedback(provider){
+  finishRefreshFeedback(provider);
+  const cell=pill.querySelector(`.cell[data-p="${provider}"]`);
+  if(!cell)return;
+  cell.classList.remove('is-pending');
+  cell.classList.add('is-refreshing');
+  refreshFeedback.set(provider,{started:Date.now(),timeout:setTimeout(()=>finishRefreshFeedback(provider),20_000)});
+}
+function finishRefreshFeedback(provider){
+  const feedback=refreshFeedback.get(provider); if(!feedback)return;
+  clearTimeout(feedback.timeout);refreshFeedback.delete(provider);
+  const remaining=Math.max(0,500-(Date.now()-feedback.started));
+  setTimeout(()=>{
+    if(!refreshFeedback.has(provider)) pill.querySelector(`.cell[data-p="${provider}"]`)?.classList.remove('is-refreshing');
+  },remaining);
+}
 pill.addEventListener('mousedown',e=>{ if(e.button!==0)return; press={x:e.clientX,y:e.clientY,id:cellAt(e.clientX,e.clientY)||hoverId}; });
 document.addEventListener('mousemove',e=>{
   if(!press||dragging)return;
@@ -1040,10 +1063,16 @@ document.addEventListener('mousemove',e=>{
 document.addEventListener('mouseup',e=>{
   if(e.button!==0)return;
   if(press&&!dragging&&press.id){
-    lastClickProvider=press.id;
+    const provider=press.id;
+    if(lastClickProvider) pill.querySelector(`.cell[data-p="${lastClickProvider}"]`)?.classList.remove('is-pending');
+    lastClickProvider=provider;
+    pill.querySelector(`.cell[data-p="${provider}"]`)?.classList.add('is-pending');
     clearTimeout(providerClickTimer);
     providerClickTimer=setTimeout(()=>{
-      invoke('refresh_provider',{provider:lastClickProvider}).catch(err=>notice('refresh_provider failed: '+err));
+      startRefreshFeedback(provider);
+      invoke('refresh_provider',{provider}).then(accepted=>{
+        if(!accepted){finishRefreshFeedback(provider);notice('refresh_provider rejected: '+provider);}
+      }).catch(err=>{finishRefreshFeedback(provider);notice('refresh_provider failed: '+err)});
       providerClickTimer=null;
     },providerClickDelay);
   }
@@ -1053,6 +1082,7 @@ pill.addEventListener('dblclick',e=>{
   if(e.button!==0)return;
   clearTimeout(providerClickTimer);providerClickTimer=null;
   const provider=cellAt(e.clientX,e.clientY)||lastClickProvider||hoverId;
+  if(provider) pill.querySelector(`.cell[data-p="${provider}"]`)?.classList.remove('is-pending');
   if(provider)invoke('open_provider_page',{provider}).catch(err=>notice('open_provider_page failed: '+err));
 });
 listen('drag_end',()=>{dragging=false;press=null;reportHot();}).catch(()=>{});
@@ -1063,31 +1093,31 @@ function notice(msg){
   clearTimeout(n._h);n._h=setTimeout(()=>n.classList.remove('show'),6000);
 }
 
-listen('usage',e=>{usage=e.payload||usage;renderRing();if(card.classList.contains('show'))renderCard();})
+listen('usage',e=>{usage=e.payload||usage;renderRing();finishRefreshFeedback('claude');if(card.classList.contains('show'))renderCard();})
   .catch(e=>notice('listen(usage) failed: '+e));
 listen('state',e=>{stateSnap=e.payload||stateSnap;setUiLanguage(stateSnap.lang_resolved);renderRing();if(card.classList.contains('show'))renderCard();})
   .catch(e=>notice('listen(state) failed: '+e));
 listen('notice',e=>notice(e.payload)).catch(()=>{});
-listen('codex',e=>{codexSnap=e.payload||codexSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
-listen('cursor',e=>{cursorSnap=e.payload||cursorSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('codex',e=>{codexSnap=e.payload||codexSnap;renderRing();finishRefreshFeedback('codex');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('cursor',e=>{cursorSnap=e.payload||cursorSnap;renderRing();finishRefreshFeedback('cursor');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_cursor').then(u=>{cursorSnap=u||cursorSnap;renderRing();}).catch(()=>{});
-listen('antigravity',e=>{agSnap=e.payload||agSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('antigravity',e=>{agSnap=e.payload||agSnap;renderRing();finishRefreshFeedback('gemini');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_antigravity').then(u=>{agSnap=u||agSnap;renderRing();}).catch(()=>{});
-listen('grok',e=>{grokSnap=e.payload||grokSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('grok',e=>{grokSnap=e.payload||grokSnap;renderRing();finishRefreshFeedback('grok');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_grok').then(u=>{grokSnap=u||grokSnap;renderRing();}).catch(()=>{});
-listen('opencode',e=>{openCodeSnap=e.payload||openCodeSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('opencode',e=>{openCodeSnap=e.payload||openCodeSnap;renderRing();finishRefreshFeedback('opencode');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_opencode').then(u=>{openCodeSnap=u||openCodeSnap;renderRing();}).catch(()=>{});
-listen('glm',e=>{glmSnap=e.payload||glmSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('glm',e=>{glmSnap=e.payload||glmSnap;renderRing();finishRefreshFeedback('glm');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_glm').then(u=>{glmSnap=u||glmSnap;renderRing();}).catch(()=>{});
-listen('devin',e=>{devinSnap=e.payload||devinSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('devin',e=>{devinSnap=e.payload||devinSnap;renderRing();finishRefreshFeedback('devin');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_devin').then(u=>{devinSnap=u||devinSnap;renderRing();}).catch(()=>{});
-listen('commandcode',e=>{commandCodeSnap=e.payload||commandCodeSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('commandcode',e=>{commandCodeSnap=e.payload||commandCodeSnap;renderRing();finishRefreshFeedback('commandcode');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_commandcode').then(u=>{commandCodeSnap=u||commandCodeSnap;renderRing();}).catch(()=>{});
-listen('kimi',e=>{kimiSnap=e.payload||kimiSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('kimi',e=>{kimiSnap=e.payload||kimiSnap;renderRing();finishRefreshFeedback('kimi');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_kimi').then(u=>{kimiSnap=u||kimiSnap;renderRing();}).catch(()=>{});
-listen('copilot',e=>{copilotSnap=e.payload||copilotSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('copilot',e=>{copilotSnap=e.payload||copilotSnap;renderRing();finishRefreshFeedback('copilot');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_copilot').then(u=>{copilotSnap=u||copilotSnap;renderRing();}).catch(()=>{});
-listen('kiro',e=>{kiroSnap=e.payload||kiroSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('kiro',e=>{kiroSnap=e.payload||kiroSnap;renderRing();finishRefreshFeedback('kiro');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_kiro').then(u=>{kiroSnap=u||kiroSnap;renderRing();}).catch(()=>{});
 loadScale();
 invoke('get_percent_basis').then(v=>{percentBasis=v==='used'?'used':'remaining';renderRing();}).catch(()=>{});

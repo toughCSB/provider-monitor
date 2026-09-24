@@ -51,7 +51,7 @@ fn auth_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".grok").join("auth.json"))
 }
 
-pub fn present() -> bool {
+fn present() -> bool {
     auth_path().map(|p| p.is_file()).unwrap_or(false)
 }
 
@@ -91,7 +91,7 @@ fn parse_date(v: Option<&serde_json::Value>) -> Option<u64> {
 }
 
 fn is_trusted(key: &str, entry: &serde_json::Value) -> bool {
-    if key.starts_with(TRUSTED_ISSUER) {
+    if key.split("::").next() == Some(TRUSTED_ISSUER) {
         return true;
     }
     entry.get("oidc_issuer").and_then(|x| x.as_str()) == Some(TRUSTED_ISSUER)
@@ -237,7 +237,23 @@ fn windows_from_credits(v: &serde_json::Value) -> Vec<LimitWindow> {
     out
 }
 
+fn auth_failure(mut snap: UsageSnapshot, note: &str) -> UsageSnapshot {
+    // A failed credential does not erase a previously measured percentage. Keep
+    // its timestamp so the notch can label the number as old, never as live.
+    snap.status = if snap.windows.is_empty() { "needsAuth" } else { "stale" }.into();
+    snap.note = note.into();
+    snap
+}
+
 fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
+    read_once_with(prev, load_credential, fetch_credits)
+}
+
+fn read_once_with<L, F>(prev: &UsageSnapshot, load: L, fetch: F) -> UsageSnapshot
+where
+    L: Fn() -> Option<Credential>,
+    F: Fn(&str) -> Result<serde_json::Value, FetchErr>,
+{
     let mut snap = prev.clone();
     let held_until = snap.backoff_until;
     let now = now_ms();
@@ -245,17 +261,23 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
         snap.note = format!("Rate limited — retrying in {}s", (held_until - now) / 1000);
         return snap;
     }
-    let Some(cred) = load_credential() else {
-        snap.status = "needsAuth".into();
-        snap.note = "Run grok login — it signs in and refreshes the token this reads.".into();
-        return snap;
+    let Some(cred) = load() else {
+        return auth_failure(snap, "Run grok login — it signs in and refreshes the token this reads.");
     };
     if cred.expires_at.map(|e| e <= now).unwrap_or(false) {
-        snap.status = "needsAuth".into();
-        snap.note = "Grok sign-in expired — run grok login again".into();
-        return snap;
+        return auth_failure(snap, "Grok sign-in expired — run grok login again");
     }
-    match fetch_credits(&cred.access_token) {
+    // Grok may rotate auth.json between our file read and the HTTP response.
+    // Re-read once before declaring the session rejected, as Claude does.
+    let result = match fetch(&cred.access_token) {
+        Err(FetchErr::NeedsAuth) => match load() {
+            Some(newer) if newer.access_token != cred.access_token
+                && newer.expires_at.map(|e| e > now_ms()).unwrap_or(true) => fetch(&newer.access_token),
+            _ => Err(FetchErr::NeedsAuth),
+        },
+        other => other,
+    };
+    match result {
         Ok(v) => {
             let windows = windows_from_credits(&v);
             snap.fetched_at = now_ms();
@@ -271,8 +293,7 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
             }
         }
         Err(FetchErr::NeedsAuth) => {
-            snap.status = "needsAuth".into();
-            snap.note = "Grok rejected its sign-in — run grok login again".into();
+            snap = auth_failure(snap, "Grok rejected its sign-in — run grok login again");
         }
         Err(FetchErr::RateLimited(secs)) => {
             snap.backoff_until = now_ms() + secs * 1000;
@@ -312,28 +333,29 @@ pub fn start(app: AppHandle) {
             let snap = st.grok.lock().unwrap().clone();
             let _ = app.emit("grok", &snap);
         }
-        if !present() {
-            broadcast(&app, UsageSnapshot { status: "absent".into(), ..Default::default() });
-            loop {
-                sleep_interruptible(600); // Grok is not installed: look again every 10 minutes
-                if present() {
-                    break;
-                }
-            }
-        }
         loop {
             let prev = {
                 let st = app.state::<AppState>();
                 let s = st.grok.lock().unwrap().clone();
                 s
             };
+            if !present() && prev.windows.is_empty() {
+                broadcast(&app, UsageSnapshot { status: "absent".into(), ..Default::default() });
+                sleep_interruptible(30);
+                continue;
+            }
             let snap = read_once(&prev);
             let hold = snap.backoff_until.saturating_sub(now_ms()) / 1000;
             if snap.status == "error" || snap.status == "stale" {
                 crate::applog(&format!("grok: {}", snap.note));
             }
+            let retry = if snap.status == "needsAuth" ||
+                (snap.status == "stale" && snap.note.contains("Grok sign-in")) ||
+                (snap.status == "stale" && snap.note.starts_with("Run grok login")) {
+                30
+            } else { POLL_SECS };
             broadcast(&app, snap);
-            sleep_interruptible(POLL_SECS.max(hold));
+            sleep_interruptible(retry.max(hold));
         }
     });
 }
@@ -403,5 +425,41 @@ mod tests {
         .unwrap();
         let entry = pick(&root).unwrap();
         assert_eq!(entry.get("key").and_then(|x| x.as_str()), Some("trusted-token"));
+        assert!(!is_trusted("https://auth.x.ai.example.com::client", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn missing_credentials_keep_the_last_measurement_marked_stale() {
+        let prev = UsageSnapshot {
+            status: "ok".into(), fetched_at: 123,
+            windows: vec![LimitWindow { id: "credits".into(), label: "Grok Build".into(),
+                                        used: 0.21, resets_at: Some(456), ..Default::default() }],
+            ..Default::default()
+        };
+        let next = read_once_with(&prev, || None, |_| unreachable!());
+        assert_eq!(next.status, "stale");
+        assert_eq!(next.windows[0].used, 0.21);
+        assert_eq!(next.windows[0].resets_at, Some(456));
+        assert_eq!(next.fetched_at, 123);
+    }
+
+    #[test]
+    fn a_rotated_cli_token_is_retried_before_reconnect_warning() {
+        let loads = std::cell::Cell::new(0);
+        let next = read_once_with(
+            &UsageSnapshot::default(),
+            || {
+                let n = loads.get(); loads.set(n + 1);
+                Some(Credential { access_token: if n == 0 { "old" } else { "new" }.into(),
+                                  expires_at: None, email: None })
+            },
+            |token| {
+                if token == "old" { Err(FetchErr::NeedsAuth) }
+                else { Ok(serde_json::json!({"config":{"creditUsagePercent":21.0}})) }
+            },
+        );
+        assert_eq!(loads.get(), 2);
+        assert_eq!(next.status, "ok");
+        assert_eq!(next.windows[0].used, 0.21);
     }
 }

@@ -1,6 +1,34 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "Grok readings stay visible, and provider clicks behave alike on Mac and Windows.": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Grok 사용량을 유지하고 Mac과 Windows에서 프로바이더 클릭을 동일하게 처리합니다."}}}
+    },
+    "Grok keeps its last reading during sign-in trouble": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "로그인 문제가 있어도 Grok의 마지막 사용량을 유지"}}}
+    },
+    "Windows marks an older Grok percentage as stale, retries after sign-in, and recognises a token rotated by Grok Build.": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Windows는 이전 Grok 수치를 오래된 값으로 표시하고, 로그인 후 재시도하며 Grok Build가 갱신한 토큰을 인식합니다."}}}
+    },
+    "Mac double-click opens the provider page": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Mac에서 더블클릭으로 프로바이더 페이지 열기"}}}
+    },
+    "One click refreshes a provider; two clicks open its configured usage or workspace page without an extra refresh.": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "한 번 클릭하면 사용량을 새로고침하고, 두 번 클릭하면 추가 새로고침 없이 설정된 사용량 또는 작업공간 페이지를 엽니다."}}}
+    },
+    "Windows refresh shows feedback": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Windows 새로고침 상태 표시"}}}
+    },
+    "A click on a provider ring now shows a refresh animation until its new reading arrives.": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "프로바이더 링을 클릭하면 새 사용량이 도착할 때까지 새로고침 애니메이션이 표시됩니다."}}}
+    },
     "": {
       "localizations": {
         "ko": {

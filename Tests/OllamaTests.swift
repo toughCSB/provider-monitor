@@ -208,6 +208,7 @@ final class OllamaModelCellTests: XCTestCase {
         for size in NotchSize.allCases {
             for edge in NotchEdge.allCases {
                 let controller = NotchWindowController()
+                controller.providerClickDelay = 0.01
                 controller.model.updateSnapshots([Fixtures.snapshots()[0], runtime])
                 controller.model.edge = edge
                 controller.model.sizeScale = size.scale
@@ -227,7 +228,9 @@ final class OllamaModelCellTests: XCTestCase {
                 var requestedIDs: [String] = []
                 controller.onRefreshProvider = { requestedIDs.append($0) }
                 panel.mouseDown(with: event)
-                for _ in 0..<100 where requestedIDs.isEmpty { await Task.yield() }
+                for _ in 0..<100 where requestedIDs.isEmpty {
+                    try? await Task.sleep(nanoseconds: 2_000_000)
+                }
                 XCTAssertEqual(requestedIDs, ["ollama-local"], edge.rawValue)
                 XCTAssertTrue(model.isRefreshing(model.snapshots[1]), edge.rawValue)
                 XCTAssertFalse(model.isRefreshing(model.snapshots[2]), edge.rawValue)
