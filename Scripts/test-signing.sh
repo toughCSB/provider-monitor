@@ -23,11 +23,21 @@ chmod +x "$fixture_dir/security" "$fixture_dir/openssl"
 export PATH="$fixture_dir:$PATH"
 
 check_signing() {
-    local label="$1" expected="$2" target output
+    local label="$1" expected="$2" target output target_expected
     for target in build test run; do
         output=$(make -n "$target")
-        if [[ "$output" != *"$expected"* ]]; then
+        target_expected="$expected"
+        if [[ "$target" == run ]]; then
+            # `run` installs a Release build into /Applications instead of
+            # opening a Debug bundle from DerivedData (a duplicate app).
+            target_expected="${expected/Debug /Release }"
+        fi
+        if [[ "$output" != *"$target_expected"* ]]; then
             printf 'FAIL: %s (%s)\n%s\n' "$label" "$target" "$output"
+            exit 1
+        fi
+        if [[ "$target" == run && "$output" != *'open "/Applications/Provider Monitor.app"'* ]]; then
+            printf 'FAIL: run did not open the canonical app\n%s\n' "$output"
             exit 1
         fi
     done
