@@ -32,6 +32,24 @@ enum ReleaseNotes {
     static var all: [ReleaseNote] {
         [
             ReleaseNote(
+                version: "1.17.3",
+                headline: L10n.t("Grok renews its own sign-in, and the Windows hover card stays on screen."),
+                changes: [
+                    ReleaseNote.Change(
+                        title: L10n.t("Grok's saved sign-in renews itself"),
+                        detail: L10n.t("Its session lives six hours and only the Grok command renews it, so Provider Monitor now runs that command headlessly the moment the session expires, on Mac and Windows alike — and says so only when that does not work.")
+                    ),
+                    ReleaseNote.Change(
+                        title: L10n.t("A stale Grok percentage stops looking like a negative"),
+                        detail: L10n.t("Windows marks an old reading the way the Mac does, by dimming it, instead of prefixing it with a tilde that read as a minus sign.")
+                    ),
+                    ReleaseNote.Change(
+                        title: L10n.t("The Windows hover card stays inside the notch window"),
+                        detail: L10n.t("Its position was computed in two coordinate systems at once, so on a display whose scale disagreed with the window the card drifted and was clipped at the bottom.")
+                    ),
+                ]
+            ),
+            ReleaseNote(
                 version: "1.17.2",
                 headline: L10n.t("Grok readings stay visible, and provider clicks behave alike on Mac and Windows."),
                 changes: [

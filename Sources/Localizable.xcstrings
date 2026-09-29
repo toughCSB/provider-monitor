@@ -1,6 +1,34 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "Grok renews its own sign-in, and the Windows hover card stays on screen.": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Grok 로그인이 스스로 갱신되고, Windows 호버 카드가 화면 안에 머뭅니다."}}}
+    },
+    "Grok's saved sign-in renews itself": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Grok 로그인이 스스로 갱신됩니다"}}}
+    },
+    "Its session lives six hours and only the Grok command renews it, so Provider Monitor now runs that command headlessly the moment the session expires, on Mac and Windows alike — and says so only when that does not work.": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Grok 세션은 6시간만 유효하고 Grok 명령만이 갱신할 수 있습니다. 이제 Provider Monitor가 세션이 만료되는 즉시 Grok 명령을 백그라운드로 실행하며, Mac과 Windows 모두에서 동작합니다. 그래도 해결되지 않을 때만 알려줍니다."}}}
+    },
+    "A stale Grok percentage stops looking like a negative": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "오래된 Grok 사용률이 음수처럼 보이지 않습니다"}}}
+    },
+    "Windows marks an old reading the way the Mac does, by dimming it, instead of prefixing it with a tilde that read as a minus sign.": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Windows도 Mac과 같은 방식으로 오래된 값을 흐리게 표시합니다. 마이너스로 읽히던 물결표를 앞에 붙이지 않습니다."}}}
+    },
+    "The Windows hover card stays inside the notch window": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Windows 호버 카드가 노치 창 안에 머뭅니다"}}}
+    },
+    "Its position was computed in two coordinate systems at once, so on a display whose scale disagreed with the window the card drifted and was clipped at the bottom.": {
+      "extractionState": "manual",
+      "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "카드 위치가 서로 다른 두 좌표계로 동시에 계산되어, 화면 배율이 창과 어긋나는 디스플레이에서 위치가 밀리고 아래쪽이 잘렸습니다."}}}
+    },
     "Grok readings stay visible, and provider clicks behave alike on Mac and Windows.": {
       "extractionState": "manual",
       "localizations": {"ko": {"stringUnit": {"state": "translated", "value": "Grok 사용량을 유지하고 Mac과 Windows에서 프로바이더 클릭을 동일하게 처리합니다."}}}

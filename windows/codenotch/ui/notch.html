@@ -609,7 +609,7 @@ function renderRing(){
     }
     svg.innerHTML=inner;
     if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
-    else if(h) pct.textContent=((h.derived||(p.id==='grok'&&staleOf(p.snap)))?'~':'')+pctText(ringPercent(h))+'%';
+    else if(h) pct.textContent=(h.derived?'~':'')+pctText(ringPercent(h))+'%';
     else pct.textContent=p.snap.windows.length?'—':'…'; // its declared window is missing: a dash, not a wait
     glyph.classList.toggle('dim', !!(h && h.used>=1));
     // A stale reading dims only what went stale: the arcs and track. The provider mark is still
@@ -777,28 +777,33 @@ function renderCard(){
 // The card follows the hovered cell: vertically centred on it (kept inside the window), tail pointing at it
 function placeCard(){
   const cell=pill.querySelector(`.cell[data-p="${hoverId}"]`)||pill;
-  const cr=cell.getBoundingClientRect();
-  const rr=(cell.querySelector('.ringwrap')||cell).getBoundingClientRect();
   card.style.left='';card.style.right='';card.style.top='';card.style.bottom='';card.style.transform='none';
   tail.style.left='';tail.style.right='';tail.style.top='';tail.style.bottom='';
+  const rootRect=document.getElementById('root').getBoundingClientRect();
+  const cardRect=card.getBoundingClientRect();
+  const cellRect=cell.getBoundingClientRect();
+  const ringRect=(cell.querySelector('.ringwrap')||cell).getBoundingClientRect();
+  const tailRect=tail.getBoundingClientRect();
+  const zoom=parseFloat(getComputedStyle(document.documentElement).zoom)||1;
+  // Geometry above is in rendered viewport pixels. Absolute CSS positions live in the zoomed
+  // root's layout pixels, so convert only at the final assignment instead of mixing coordinates.
+  const rootX=x=>(x-rootRect.left)/zoom, rootY=y=>(y-rootRect.top)/zoom;
   if(notchEdge==='right'||notchEdge==='left'){
-    const cy=cr.top+cr.height/2;
-    const H=innerHeight, ch=card.offsetHeight||0;
-    let top=Math.round(cy-ch/2); top=Math.max(8,Math.min(top,H-ch-8));
-    card.style.top=top+'px';
+    const cy=cellRect.top+cellRect.height/2, ch=cardRect.height;
+    let top=Math.round(cy-ch/2); top=Math.max(rootRect.top+8,Math.min(top,rootRect.bottom-ch-8));
+    card.style.top=rootY(top)+'px';
     // The tail's point on the hovered ring (not the cell, which includes the label below it), kept off the card's rounded corners
-    const ry=rr.top+rr.height/2;
-    const th=tail.getBoundingClientRect().height||36, ty=Math.max(top+16+th/2,Math.min(top+ch-16-th/2,ry));
-    tail.style.top=Math.round(ty-th/2)+'px';
+    const ry=ringRect.top+ringRect.height/2;
+    const th=tailRect.height, ty=Math.max(top+16+th/2,Math.min(top+ch-16-th/2,ry));
+    tail.style.top=rootY(Math.round(ty-th/2))+'px';
   }else{
-    const cx=cr.left+cr.width/2;
-    const W=innerWidth, cw=card.offsetWidth||226;
-    let left=Math.round(cx-cw/2); left=Math.max(8,Math.min(left,W-cw-8));
-    card.style.left=left+'px';
-    const rx=rr.left+rr.width/2;
-    const tw=tail.getBoundingClientRect().width||33;
+    const cx=cellRect.left+cellRect.width/2, cw=cardRect.width;
+    let left=Math.round(cx-cw/2); left=Math.max(rootRect.left+8,Math.min(left,rootRect.right-cw-8));
+    card.style.left=rootX(left)+'px';
+    const rx=ringRect.left+ringRect.width/2;
+    const tw=tailRect.width;
     const tx=Math.max(left+16+tw/2,Math.min(left+cw-16-tw/2,rx));
-    tail.style.left=Math.round(tx-tw/2)+'px';
+    tail.style.left=rootX(Math.round(tx-tw/2))+'px';
   }
 }
 
@@ -807,7 +812,7 @@ function esc(s){const d=document.createElement('div');d.textContent=s||'';return
 /* Hover: stays expanded while either the pill or the card is under the cursor; collapses after a 250 ms grace period (upstream motion rule) */
 const card=document.getElementById('card'), pill=document.getElementById('pill'), tail=document.getElementById('tail'), ctxmenu=document.getElementById('ctxmenu');
 let hideTimer=null, menuPinned=false;
-function showCard(){clearTimeout(hideTimer);card.classList.add('show');renderCard();armWatchdog();refreshClock();} // show first, then render: placeCard needs offsetHeight
+function showCard(){clearTimeout(hideTimer);card.classList.add('show');renderCard();armWatchdog();refreshClock();} // show first, then render: placeCard needs rendered dimensions
 // Nothing is broadcast when the Windows clock format changes, so ask again each time the card opens
 function refreshClock(){
   invoke('get_state').then(s=>{

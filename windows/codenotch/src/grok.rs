@@ -5,8 +5,8 @@
 //! `auth.x.ai`. The file is keyed by `issuer::client_id`; only an entry whose key starts with
 //! `https://auth.x.ai` (or whose `oidc_issuer` field says so) is trusted — Grok also supports a
 //! customer IdP whose token is meant for a private proxy, and sending that to the public
-//! `cli-chat-proxy.grok.com` would hand someone else's credential to the wrong endpoint. Read only,
-//! never refreshed — that is the CLI's job.
+//! `cli-chat-proxy.grok.com` would hand someone else's credential to the wrong endpoint. Only the
+//! Grok CLI refreshes this file, so an expired session is renewed by launching its reauth command.
 //!
 //! Endpoint: `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`
 //! Headers: `Authorization: Bearer <token>`, `X-XAI-Token-Auth: xai-grok-cli`, `Accept: application/json`
@@ -25,7 +25,7 @@
 
 use crate::usage::{LimitWindow, UsageSnapshot};
 use crate::AppState;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -33,6 +33,8 @@ const ENDPOINT: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credit
 const POLL_SECS: u64 = 300; // Grok has no session state to key off, same fixed cadence as Codex
 const BACKOFF_MIN_SECS: u64 = 60;
 const TRUSTED_ISSUER: &str = "https://auth.x.ai";
+const RENEW_COOLDOWN_MS: u64 = 10 * 60 * 1000;
+const RENEW_TIMEOUT_SECS: u64 = 45;
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -124,6 +126,114 @@ fn load_credential() -> Option<Credential> {
         expires_at: parse_date(entry.get("expires_at")),
         email: entry.get("email").and_then(|x| x.as_str()).map(String::from),
     })
+}
+
+// ---------------- token renewal ----------------
+
+fn find_grok_cli() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".grok").join("bin").join("grok.exe"));
+        candidates.push(home.join(".local").join("bin").join("grok.exe"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join("Programs").join("grok").join("grok.exe"));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join("grok.exe"));
+            candidates.push(dir.join("grok.cmd"));
+        }
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Grok refreshes an OIDC session only after it has expired. One launch per expiry plus a global
+/// cooldown prevents a broken CLI or unchanged auth file from being hammered every poll.
+fn should_renew(expires_at: Option<u64>, now: u64, attempted_for: Option<u64>, last_attempt: Option<u64>) -> bool {
+    let Some(exp) = expires_at else { return false };
+    if exp > now || attempted_for == Some(exp) {
+        return false;
+    }
+    if let Some(last) = last_attempt {
+        if now.saturating_sub(last) < RENEW_COOLDOWN_MS {
+            return false;
+        }
+    }
+    true
+}
+
+fn run_renewal(cli: &Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(cli);
+    cmd.args(["agent", "--reauth", "stdio"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("GROK_HOME")
+        .env_remove("GROK_AUTH")
+        .env_remove("GROK_AUTH_PATH");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(RENEW_TIMEOUT_SECS);
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Renewer {
+    attempted_for: Option<u64>,
+    last_attempt: Option<u64>,
+}
+
+impl Renewer {
+    fn maybe_renew(&mut self, cred: &Credential) -> Option<bool> {
+        self.maybe_renew_with(cred, now_ms(), find_grok_cli, run_renewal, load_credential)
+    }
+
+    fn maybe_renew_with<C, R, L>(&mut self, cred: &Credential, now: u64, cli: C, run: R, load: L) -> Option<bool>
+    where
+        C: FnOnce() -> Option<PathBuf>,
+        R: FnOnce(&Path) -> std::io::Result<()>,
+        L: FnOnce() -> Option<Credential>,
+    {
+        if !should_renew(cred.expires_at, now, self.attempted_for, self.last_attempt) {
+            return None;
+        }
+        self.last_attempt = Some(now);
+        self.attempted_for = cred.expires_at;
+        crate::applog("grok: attempting expired token renewal");
+        let Some(cli) = cli() else {
+            crate::applog("grok: expired token renewal failed: Grok CLI not found");
+            return Some(false);
+        };
+        if let Err(e) = run(&cli) {
+            crate::applog(&format!("grok: token renewal failed to run {}: {e}", cli.display()));
+            return Some(false);
+        }
+        let after = load().and_then(|c| c.expires_at);
+        let renewed = matches!((after, cred.expires_at), (Some(a), Some(b)) if a > b);
+        if renewed {
+            crate::applog(&format!("grok: token renewed via {}", cli.display()));
+            request_refresh();
+        } else {
+            crate::applog(&format!("grok: token renewal via {} did not move the expiry", cli.display()));
+        }
+        Some(renewed)
+    }
 }
 
 /// For doctor: contains no secret values
@@ -245,14 +355,15 @@ fn auth_failure(mut snap: UsageSnapshot, note: &str) -> UsageSnapshot {
     snap
 }
 
-fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
-    read_once_with(prev, load_credential, fetch_credits)
+fn read_once(prev: &UsageSnapshot, renewer: &mut Renewer) -> UsageSnapshot {
+    read_once_with(prev, load_credential, fetch_credits, |cred| renewer.maybe_renew(cred))
 }
 
-fn read_once_with<L, F>(prev: &UsageSnapshot, load: L, fetch: F) -> UsageSnapshot
+fn read_once_with<L, F, R>(prev: &UsageSnapshot, load: L, fetch: F, mut renew: R) -> UsageSnapshot
 where
     L: Fn() -> Option<Credential>,
     F: Fn(&str) -> Result<serde_json::Value, FetchErr>,
+    R: FnMut(&Credential) -> Option<bool>,
 {
     let mut snap = prev.clone();
     let held_until = snap.backoff_until;
@@ -261,11 +372,20 @@ where
         snap.note = format!("Rate limited — retrying in {}s", (held_until - now) / 1000);
         return snap;
     }
-    let Some(cred) = load() else {
+    let Some(mut cred) = load() else {
         return auth_failure(snap, "Run grok login — it signs in and refreshes the token this reads.");
     };
     if cred.expires_at.map(|e| e <= now).unwrap_or(false) {
-        return auth_failure(snap, "Grok sign-in expired — run grok login again");
+        if renew(&cred) != Some(true) {
+            return auth_failure(snap, "Grok sign-in expired — run grok login again");
+        }
+        let Some(renewed) = load() else {
+            return auth_failure(snap, "Grok sign-in expired — run grok login again");
+        };
+        if renewed.expires_at.map(|e| e <= now_ms()).unwrap_or(false) {
+            return auth_failure(snap, "Grok sign-in expired — run grok login again");
+        }
+        cred = renewed;
     }
     // Grok may rotate auth.json between our file read and the HTTP response.
     // Re-read once before declaring the session rejected, as Claude does.
@@ -333,6 +453,7 @@ pub fn start(app: AppHandle) {
             let snap = st.grok.lock().unwrap().clone();
             let _ = app.emit("grok", &snap);
         }
+        let mut renewer = Renewer::default();
         loop {
             let prev = {
                 let st = app.state::<AppState>();
@@ -344,7 +465,7 @@ pub fn start(app: AppHandle) {
                 sleep_interruptible(30);
                 continue;
             }
-            let snap = read_once(&prev);
+            let snap = read_once(&prev, &mut renewer);
             let hold = snap.backoff_until.saturating_sub(now_ms()) / 1000;
             if snap.status == "error" || snap.status == "stale" {
                 crate::applog(&format!("grok: {}", snap.note));
@@ -436,7 +557,7 @@ mod tests {
                                         used: 0.21, resets_at: Some(456), ..Default::default() }],
             ..Default::default()
         };
-        let next = read_once_with(&prev, || None, |_| unreachable!());
+        let next = read_once_with(&prev, || None, |_| unreachable!(), |_| unreachable!());
         assert_eq!(next.status, "stale");
         assert_eq!(next.windows[0].used, 0.21);
         assert_eq!(next.windows[0].resets_at, Some(456));
@@ -457,9 +578,90 @@ mod tests {
                 if token == "old" { Err(FetchErr::NeedsAuth) }
                 else { Ok(serde_json::json!({"config":{"creditUsagePercent":21.0}})) }
             },
+            |_| None,
         );
         assert_eq!(loads.get(), 2);
         assert_eq!(next.status, "ok");
         assert_eq!(next.windows[0].used, 0.21);
+    }
+
+    #[test]
+    fn an_expired_token_is_renewed_and_fetched_in_the_same_poll() {
+        let now = now_ms();
+        let loads = std::cell::Cell::new(0);
+        let renewals = std::cell::Cell::new(0);
+        let next = read_once_with(
+            &UsageSnapshot::default(),
+            || {
+                let n = loads.get(); loads.set(n + 1);
+                Some(Credential {
+                    access_token: if n == 0 { "expired" } else { "fresh" }.into(),
+                    expires_at: Some(if n == 0 { now.saturating_sub(1) } else { now + 60_000 }),
+                    email: None,
+                })
+            },
+            |token| {
+                assert_eq!(token, "fresh");
+                Ok(serde_json::json!({"config":{"creditUsagePercent":21.0}}))
+            },
+            |_| {
+                renewals.set(renewals.get() + 1);
+                Some(true)
+            },
+        );
+        assert_eq!(loads.get(), 2);
+        assert_eq!(renewals.get(), 1);
+        assert_eq!(next.status, "ok");
+        assert_eq!(next.windows[0].used, 0.21);
+    }
+
+    #[test]
+    fn renewal_is_gated_by_expiry_attempt_and_cooldown() {
+        const EXP: u64 = 2_000_000;
+        assert!(should_renew(Some(EXP), EXP, None, None), "the exact expiry boundary renews");
+        assert!(!should_renew(Some(EXP), EXP - 1, None, None), "a future token does not renew");
+        assert!(!should_renew(Some(EXP), EXP, Some(EXP), None), "the same expiry is attempted once");
+        assert!(!should_renew(
+            Some(EXP),
+            EXP,
+            None,
+            Some(EXP - RENEW_COOLDOWN_MS + 1),
+        ));
+        assert!(should_renew(
+            Some(EXP),
+            EXP,
+            None,
+            Some(EXP - RENEW_COOLDOWN_MS),
+        ));
+    }
+
+    #[test]
+    fn injected_renewal_is_judged_by_the_expiry_moving() {
+        let cred = Credential { access_token: "expired".into(), expires_at: Some(100), email: None };
+        let fake_cli = PathBuf::from("grok.exe");
+
+        let mut moved = Renewer::default();
+        assert_eq!(
+            moved.maybe_renew_with(
+                &cred,
+                100,
+                || Some(fake_cli.clone()),
+                |_| Ok(()),
+                || Some(Credential { access_token: "fresh".into(), expires_at: Some(200), email: None }),
+            ),
+            Some(true)
+        );
+
+        let mut unchanged = Renewer::default();
+        assert_eq!(
+            unchanged.maybe_renew_with(
+                &cred,
+                100,
+                || Some(fake_cli),
+                |_| Ok(()),
+                || Some(Credential { access_token: "same".into(), expires_at: Some(100), email: None }),
+            ),
+            Some(false)
+        );
     }
 }

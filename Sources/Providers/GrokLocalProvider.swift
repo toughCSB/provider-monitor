@@ -26,6 +26,12 @@ actor GrokLocalProvider: UsageProvider {
 
     nonisolated func account() -> ProviderAccount? { GrokCredentials.account() }
 
+    /// The saved session's expiry, read from disk. The refresher asks this on
+    /// every tick and again after a launch, so it is deliberately the cheapest
+    /// question available: one small file, no keychain and no network. Nothing
+    /// is cached between calls, so reading it again *is* the reload.
+    var tokenExpiry: Date? { (try? GrokCredentials.load(from: authURL))?.expiresAt }
+
     func fetchSnapshot() async throws -> ProviderSnapshot {
         let credentials = try GrokCredentials.load(from: authURL)
         if credentials.isExpired { throw UsageProviderError.credentialExpired }

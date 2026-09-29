@@ -24,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Keeps the Claude keychain token from ageing out on a Mac where the CLI
     /// is never run by hand. See `ClaudeTokenRefresher`.
     private var tokenRefresher: ClaudeTokenRefresher?
+    /// Renews Grok's six-hour session the same way, by launching its CLI. See
+    /// `GrokTokenRefresher`.
+    private var grokTokenRefresher: GrokTokenRefresher?
     private var cancellables = Set<AnyCancellable>()
     /// Turns the monitors' running commentary into the one event worth
     /// interrupting for: an agent that has just stopped working.
@@ -72,6 +75,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// refresher needs to ask one of them how long its token has left, and the
     /// protocol has no business carrying that.
     private var claudeProviders: [ClaudeOAuthProvider] = []
+    /// Held for the same reason as `claudeProviders`: the Grok refresher asks it
+    /// how long its saved session has left, which is a question the provider
+    /// protocol has no business carrying.
+    private var grokProvider: GrokLocalProvider?
     /// MiniMax Platform sign-in sheet. Not a UsageProvider — that is MiniMaxProvider.
     private var miniMaxWeb: WebSessionProvider?
 
@@ -138,11 +145,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.usage.info("codex profiles: \(self.codexProfiles.map(\.displayPath).joined(separator: ", "), privacy: .public)")
             let claudeProviders = claudeProfiles.map { ClaudeOAuthProvider(profile: $0) }
             self.claudeProviders = claudeProviders
+            let grokProvider = GrokLocalProvider()
+            self.grokProvider = grokProvider
             let allProviders: [UsageProvider] = claudeProviders
                 + [CursorLocalProvider()]
                 + codexProfiles.map { CodexLocalProvider(profile: $0) }
                 + [AntigravityProvider(),
-                   GLMProvider(), MiniMaxProvider(web: miniMaxWeb), GrokLocalProvider(), DevinLocalProvider(), OpenCodeProvider(),
+                   GLMProvider(), MiniMaxProvider(web: miniMaxWeb), grokProvider, DevinLocalProvider(), OpenCodeProvider(),
                    CommandCodeProvider(), GitHubCopilotProvider(), KimiProvider(), KiroProvider(),
                    OllamaLocalProvider(endpoint: URL(string: preferences.ollamaEndpoint)!),
                    LMStudioLocalProvider(endpoint: URL(string: preferences.lmstudioEndpoint)!),
@@ -750,6 +759,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             refresher.start()
             tokenRefresher = refresher
         }
+
+        // Grok's session lives six hours and only its CLI renews it, so the same
+        // treatment as Claude's keychain token: launch the command once the
+        // session has expired, and judge it by whether the expiry moved. The
+        // headless run writes no session file of its own, so unlike Claude there
+        // is no monitor to tell about the pid.
+        if let grokProvider {
+            let grokRefresher = GrokTokenRefresher(expiry: { await grokProvider.tokenExpiry })
+            grokRefresher.$outcome
+                .receive(on: RunLoop.main)
+                .sink { [weak self] outcome in
+                    guard case .failed = outcome else { return }
+                    self?.store?.reportRenewalFailed(providerID: grokProvider.id)
+                }
+                .store(in: &cancellables)
+            grokRefresher.start()
+            grokTokenRefresher = grokRefresher
+        }
         let activity = ActivityCoordinator(monitors: monitors) { [weak self, weak fleet] id, sessions in
             guard let fleet else { return }
             fleet.setSessions(providerID: id, sessions: sessions)
@@ -978,6 +1005,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ollamaRelay?.configure(enabled: false, endpoint: OllamaEndpoint.defaultAddress)
         lmstudioMetrics?.stop()
         tokenRefresher?.stop()
+        grokTokenRefresher?.stop()
         store?.stop()
         activityCoordinator?.stop()
         notchFleet?.stop()
