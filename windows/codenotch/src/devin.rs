@@ -235,18 +235,11 @@ pub fn present() -> bool {
         .any(|path| path.is_file())
 }
 
-/// Doctor output contains identity/source metadata only, never the session key or a fragment of it.
+/// Doctor output contains a source label, never account or session values.
 pub fn probe() -> String {
     let paths = credential_paths();
     match load_credential_from(&paths) {
-        Some(credential) => format!(
-            "Devin: session found via {}{}",
-            credential.source,
-            credential
-                .email
-                .map(|email| format!(", account={email}"))
-                .unwrap_or_default()
-        ),
+        Some(credential) => format!("Devin: session found via {}", credential.source),
         None if present() => {
             "Devin: credential source exists but no usable session was found".into()
         }
@@ -332,12 +325,7 @@ fn parse_usage(value: &serde_json::Value) -> Result<ParsedUsage, String> {
 }
 
 fn retry_after_secs(response: &ureq::Response) -> u64 {
-    response
-        .header("retry-after")
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .map(|value| value.max(BACKOFF_MIN_SECS as f64) as u64)
-        .unwrap_or(BACKOFF_MIN_SECS)
+    crate::polling::retry_after_secs(response.header("retry-after"), now_ms(), BACKOFF_MIN_SECS)
 }
 
 enum FetchErr {
@@ -429,7 +417,7 @@ fn read_once(previous: &UsageSnapshot) -> UsageSnapshot {
             snapshot.note = "Devin denied access to this account's usage.".into();
         }
         Err(FetchErr::RateLimited(seconds)) => {
-            snapshot.backoff_until = now_ms() + seconds * 1000;
+            snapshot.backoff_until = crate::polling::deadline_ms(now_ms(), seconds);
             snapshot.status = if snapshot.windows.is_empty() {
                 "backoff"
             } else {
@@ -496,12 +484,12 @@ pub fn start(app: AppHandle) {
                 snapshot
             };
             let snapshot = read_once(&previous);
-            let hold = snapshot.backoff_until.saturating_sub(now_ms()) / 1000;
+            let deadline = snapshot.backoff_until;
             if snapshot.status == "error" || snapshot.status == "stale" {
                 crate::applog(&format!("devin: {}", snapshot.note));
             }
             broadcast(&app, snapshot);
-            sleep_interruptible(POLL_SECS.max(hold));
+            sleep_interruptible(crate::polling::poll_wait_secs(POLL_SECS, deadline, now_ms()));
         }
     });
 }

@@ -95,11 +95,10 @@ final class ClaudeTokenRefresherTests: XCTestCase {
     /// Code's own five, or the command's start-up decides there is nothing to
     /// do and the launch is wasted.
     func testItOnlyRunsInsideTheMargin() {
+        var policy = TokenRenewalPolicy()
         func shouldRenew(_ remaining: TimeInterval) -> Bool {
-            ClaudeTokenRefresher.shouldRenew(
-                expiry: inSeconds(remaining), now: now, margin: 4 * 60,
-                attemptedFor: nil, lastAttempt: nil, cooldown: 600
-            )
+            policy.shouldAttempt(expiry: inSeconds(remaining), now: now,
+                                 margin: 4 * 60, cooldown: 600)
         }
         XCTAssertFalse(shouldRenew(8 * 60), "eight minutes out, nothing to do")
         XCTAssertFalse(shouldRenew(5 * 60), "five is still outside our margin")
@@ -109,38 +108,39 @@ final class ClaudeTokenRefresherTests: XCTestCase {
 
     /// Never on a guess: no reading yet means no idea how long is left.
     func testItNeverRunsWithoutAnExpiry() {
-        XCTAssertFalse(ClaudeTokenRefresher.shouldRenew(
-            expiry: nil, now: now, margin: 4 * 60,
-            attemptedFor: nil, lastAttempt: nil, cooldown: 600
-        ))
+        var policy = TokenRenewalPolicy()
+        XCTAssertFalse(policy.shouldAttempt(expiry: nil, now: now,
+                                            margin: 4 * 60, cooldown: 600))
     }
 
-    /// The no-retry-loop guarantee, and the reason it is expressed as "one
-    /// attempt per token" rather than as a timer: a launch that failed to move
-    /// the expiry leaves the same value here on the next tick, so it is refused
-    /// for as long as the token stays unrenewed — not merely for a cooldown.
-    func testATokenGetsOneAttemptEver() {
+    /// The policy permits another try only after cooldown and resets its
+    /// budget when a different expiry is observed.
+    func testThePolicyBoundsRetriesPerExpiry() {
         let expiry = inSeconds(60)
-        XCTAssertFalse(ClaudeTokenRefresher.shouldRenew(
-            expiry: expiry, now: now, margin: 4 * 60,
-            attemptedFor: expiry, lastAttempt: nil, cooldown: 600
-        ))
-        // A different token is a different question.
-        XCTAssertTrue(ClaudeTokenRefresher.shouldRenew(
-            expiry: inSeconds(120), now: now, margin: 4 * 60,
-            attemptedFor: expiry, lastAttempt: nil, cooldown: 600
-        ))
+        var policy = TokenRenewalPolicy()
+        for attempt in 0..<TokenRenewalPolicy.maxAttempts {
+            let instant = now.addingTimeInterval(Double(attempt) * 600)
+            XCTAssertTrue(policy.shouldAttempt(expiry: expiry, now: instant,
+                                               margin: 4 * 60, cooldown: 600))
+            policy.recordAttempt(at: instant)
+        }
+        XCTAssertFalse(policy.shouldAttempt(expiry: expiry, now: now.addingTimeInterval(1800),
+                                            margin: 4 * 60, cooldown: 600))
+        XCTAssertTrue(policy.shouldAttempt(expiry: inSeconds(120),
+                                           now: now.addingTimeInterval(1800),
+                                           margin: 4 * 60, cooldown: 600))
     }
 
     func testTheCooldownHoldsOffASecondLaunch() {
-        XCTAssertFalse(ClaudeTokenRefresher.shouldRenew(
-            expiry: inSeconds(60), now: now, margin: 4 * 60,
-            attemptedFor: nil, lastAttempt: now.addingTimeInterval(-60), cooldown: 600
-        ))
-        XCTAssertTrue(ClaudeTokenRefresher.shouldRenew(
-            expiry: inSeconds(60), now: now, margin: 4 * 60,
-            attemptedFor: nil, lastAttempt: now.addingTimeInterval(-900), cooldown: 600
-        ))
+        var policy = TokenRenewalPolicy()
+        let expiry = inSeconds(60)
+        XCTAssertTrue(policy.shouldAttempt(expiry: expiry, now: now,
+                                           margin: 4 * 60, cooldown: 600))
+        policy.recordAttempt(at: now)
+        XCTAssertFalse(policy.shouldAttempt(expiry: expiry, now: inSeconds(599),
+                                            margin: 4 * 60, cooldown: 600))
+        XCTAssertTrue(policy.shouldAttempt(expiry: expiry, now: inSeconds(600),
+                                           margin: 4 * 60, cooldown: 600))
     }
 
     // MARK: - Running it
@@ -227,17 +227,50 @@ final class ClaudeTokenRefresherTests: XCTestCase {
         XCTAssertTrue(message.contains("renew"), "the message has to say what to do: \(message)")
     }
 
-    /// And having said so, it stops: the same token never gets a second launch.
-    func testAFailureDoesNotLoop() async {
+    /// A failed after-check gets two more tries, never a fourth. A later
+    /// expiry change gets a fresh budget even without recreating the refresher.
+    func testFailureRetriesThreeTimesThenNewExpiryResetsBudget() async {
         let spy = Spy()
-        let stuck = inSeconds(60)
-        let refresher = refresher(spy: spy, before: stuck, after: stuck)
+        var current = inSeconds(60)
+        let refresher = ClaudeTokenRefresher(
+            expiry: { current }, reload: { current },
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
+            launcher: { _, _ in spy.launches += 1; return (4242, { 1 }) }
+        )
 
         await refresher.considerRenewing(now: now)
-        await refresher.considerRenewing(now: now.addingTimeInterval(3600))
-        await refresher.considerRenewing(now: now.addingTimeInterval(7200))
+        await refresher.considerRenewing(now: inSeconds(600))
+        await refresher.considerRenewing(now: inSeconds(1200))
+        await refresher.considerRenewing(now: inSeconds(1800))
+        XCTAssertEqual(spy.launches, 3)
 
-        XCTAssertEqual(spy.launches, 1, "one launch per token, however long it is left running")
+        current = inSeconds(120)
+        await refresher.considerRenewing(now: inSeconds(1800))
+        XCTAssertEqual(spy.launches, 4)
+    }
+
+    func testFirstFailureThenCooldownThenSuccessDoesNotRepeatOnStaleExpiry() async {
+        let spy = Spy()
+        let stuck = inSeconds(60)
+        let after = inSeconds(8 * 3600)
+        var afterCheck = stuck
+        let refresher = ClaudeTokenRefresher(
+            expiry: { stuck }, reload: { afterCheck },
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
+            launcher: { _, _ in
+                spy.launches += 1
+                if spy.launches == 2 { afterCheck = after }
+                return (4242, { 1 })
+            }
+        )
+
+        await refresher.considerRenewing(now: now)
+        await refresher.considerRenewing(now: inSeconds(599))
+        XCTAssertEqual(spy.launches, 1)
+        await refresher.considerRenewing(now: inSeconds(600))
+        XCTAssertEqual(refresher.outcome, .refreshed(until: after))
+        await refresher.considerRenewing(now: inSeconds(1200))
+        XCTAssertEqual(spy.launches, 2)
     }
 
     func testACommandThatWillNotStartIsReported() async {
@@ -290,6 +323,25 @@ final class ClaudeTokenRefresherTests: XCTestCase {
         XCTAssertEqual(refresher.outcome, .idle)
     }
 
+    func testStartAndStopAreIdempotent() {
+        let refresher = refresher(spy: Spy(), before: nil, after: nil)
+        defer { refresher.stop() }
+
+        refresher.start()
+        let first = refresher.timerForTesting
+        XCTAssertNotNil(first)
+        refresher.start()
+        XCTAssertTrue(first === refresher.timerForTesting)
+
+        refresher.stop()
+        refresher.stop()
+        XCTAssertNil(refresher.timerForTesting)
+
+        refresher.start()
+        XCTAssertNotNil(refresher.timerForTesting)
+        XCTAssertFalse(first === refresher.timerForTesting)
+    }
+
     // MARK: - No concurrent launches
 
     /// `isRunning` has to be claimed *before* `considerRenewing`'s only
@@ -298,10 +350,9 @@ final class ClaudeTokenRefresherTests: XCTestCase {
     /// claimed yet and go on to launch its own process too.
     ///
     /// Worth being exact about what this is testing, because two *other*
-    /// mechanisms can look like they cover this from the outside: `attemptedFor`
-    /// (one attempt per token) and the cooldown (`lastAttempt`) both also end
-    /// up blocking a second overlapping call in practice, as a side effect of
-    /// MainActor being serial — whichever call resumes first runs its whole
+    /// mechanisms can look like they cover this from the outside: the policy's
+    /// attempt count and cooldown can also block a second call because the
+    /// MainActor is serial — whichever call resumes first runs its whole
     /// synchronous stretch, writing both of those, before the second call ever
     /// reaches its own check. That is real, and worth having, but it is
     /// incidental: it depends on the two calls agreeing on roughly the same
@@ -372,6 +423,83 @@ final class ClaudeTokenRefresherTests: XCTestCase {
     }
 
     // MARK: - The real subprocess
+
+    /// The initializer's real launcher sends a named profile's exact config
+    /// directory to the child. This executable only records its environment;
+    /// it never invokes Claude Code or reads a credential.
+    func testNamedProfileDirectoryReachesRealProcess() async throws {
+        let (root, executable, output) = try makeEnvironmentProbe()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = ClaudeProfile(slug: "work",
+                                    configDirectory: root.appendingPathComponent(".claude-work"))
+        let refresher = ClaudeTokenRefresher(
+            expiry: { self.inSeconds(60) },
+            reload: { self.inSeconds(8 * 3600) },
+            cli: executable,
+            profile: profile
+        )
+
+        await refresher.considerRenewing(now: now)
+
+        XCTAssertEqual(refresher.outcome, .refreshed(until: inSeconds(8 * 3600)))
+        XCTAssertEqual(try String(contentsOf: output, encoding: .utf8),
+                       profile.configDirectory.path)
+    }
+
+    func testNamedProfileKeepsInjectedLauncherSignature() async {
+        let spy = Spy()
+        let profile = ClaudeProfile(slug: "work",
+                                    configDirectory: URL(fileURLWithPath: "/tmp/.claude-work"))
+        let refresher = ClaudeTokenRefresher(
+            expiry: { self.inSeconds(60) },
+            reload: { self.inSeconds(8 * 3600) },
+            cli: URL(fileURLWithPath: "/fake/claude"),
+            profile: profile,
+            launcher: { cli, timeout in
+                XCTAssertEqual(cli.path, "/fake/claude")
+                XCTAssertEqual(timeout, 30)
+                spy.launches += 1
+                return (4242, { 1 })
+            }
+        )
+
+        await refresher.considerRenewing(now: now)
+
+        XCTAssertEqual(spy.launches, 1)
+        XCTAssertEqual(refresher.outcome, .refreshed(until: inSeconds(8 * 3600)))
+    }
+
+    /// A GUI process could inherit another profile's override. The default
+    /// profile must remove it before launching its own process.
+    func testDefaultProfileDoesNotInheritAnotherConfigDirectory() async throws {
+        let (root, executable, output) = try makeEnvironmentProbe()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let otherDirectory = root.appendingPathComponent(".claude-other").path
+
+        let (_, exit) = try ClaudeTokenRefresher.run(
+            executable, timeout: 2, profile: .default(home: root),
+            inheritedEnvironment: ["CLAUDE_CONFIG_DIR": otherDirectory]
+        )
+
+        let status = await exit()
+        XCTAssertEqual(status, 0)
+        XCTAssertEqual(try String(contentsOf: output, encoding: .utf8), "<unset>")
+    }
+
+    private func makeEnvironmentProbe() throws -> (root: URL, executable: URL, output: URL) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-renewal-probe-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("probe.sh")
+        let output = root.appendingPathComponent("config-dir")
+        let script = """
+        #!/bin/sh
+        printf '%s' "${CLAUDE_CONFIG_DIR-<unset>}" > "${0%/*}/config-dir"
+        """
+        try Data(script.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        return (root, executable, output)
+    }
 
     /// `run(_:timeout:)` is what actually spawns `claude`, and it is the one
     /// piece of this feature every other test above deliberately swaps out —

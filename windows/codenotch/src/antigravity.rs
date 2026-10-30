@@ -3,7 +3,7 @@
 //! Preferred path: when official Antigravity CLI (`agy.exe`) is installed
 //! (`%LOCALAPPDATA%\agy\bin\agy.exe` or `PATH`), executes standalone `agy --print /usage`
 //! via native Windows ConPTY inside a bounded JobObject without running the full IDE.
-//! Refreshes at startup and explicit/hover requests with a 5-minute TTL cache.
+//! Refreshes at startup and periodically, with a 5-minute CLI TTL cache.
 //!
 //! Fallback path, when the CLI is absent (as upstream, most honest first):
 //!   1. Local bridge: find the `language_server*` process (its command line carries
@@ -40,7 +40,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
-const POLL_SECS: u64 = 300;
+const POLL_ACTIVE_SECS: u64 = 60;
+const POLL_IDLE_SECS: u64 = 300;
 const CLI_TTL: Duration = Duration::from_secs(300);
 const LOAD_CODE_ASSIST: &str = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const QUOTA_SUMMARY: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
@@ -48,29 +49,20 @@ const LS_SERVICE: &str = "/exa.language_server_pb.LanguageServerService/Retrieve
 const CSRF_HEADER: &str = "x-codeium-csrf-token";
 
 static REFRESH_CLI: Mutex<Option<std::sync::mpsc::SyncSender<()>>> = Mutex::new(None);
-static REFRESH_LEGACY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn request_refresh() {
     if let Some(sender) = REFRESH_CLI.lock().unwrap().as_ref() {
         let _ = sender.try_send(());
-    } else {
-        REFRESH_LEGACY.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 pub fn request_hover_refresh() {
     // Hover must not wake the legacy adapter's periodic poller.
-    if let Some(sender) = REFRESH_CLI.lock().unwrap().as_ref() {
-        let _ = sender.try_send(());
+    if crate::agy_cli::find_agy().is_some() {
+        if let Some(sender) = REFRESH_CLI.lock().unwrap().as_ref() {
+            let _ = sender.try_send(());
+        }
     }
-}
-
-#[cfg(test)]
-#[test]
-fn hover_does_not_request_legacy_refresh() {
-    assert!(REFRESH_CLI.lock().unwrap().is_none());
-    request_hover_refresh();
-    assert!(!REFRESH_LEGACY.load(std::sync::atomic::Ordering::Relaxed));
 }
 
 fn now_ms() -> u64 {
@@ -706,108 +698,76 @@ fn broadcast(app: &AppHandle, snap: UsageSnapshot) {
     emit_snapshot(app, snap);
 }
 
-fn sleep_interruptible(secs: u64) {
-    for _ in 0..secs {
-        if REFRESH_LEGACY.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
 pub fn start(app: AppHandle) {
-    if crate::agy_cli::find_agy().is_some() {
-        start_cli(app);
-    } else {
-        start_legacy(app);
-    }
-}
-
-fn start_cli(app: AppHandle) {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     *REFRESH_CLI.lock().unwrap() = Some(sender);
 
     std::thread::spawn(move || {
-        {
-            emit_current(&app);
-        }
-
+        emit_current(&app);
         let mut last_attempt: Option<Instant> = None;
-
-        while receiver.recv().is_ok() {
-            if last_attempt.is_some_and(|last| last.elapsed() < CLI_TTL) {
-                continue;
-            }
-            let st = app.state::<AppState>();
-            let previous = st.antigravity.lock().unwrap().clone();
-            if !previous.windows.is_empty()
-                && now_ms().saturating_sub(previous.fetched_at) < CLI_TTL.as_millis() as u64
-            {
-                continue;
-            }
-            last_attempt = Some(Instant::now());
-
-            let snap = match crate::agy_cli::read_quota() {
-                Ok(windows) => UsageSnapshot {
-                    status: "ok".into(),
-                    windows,
-                    fetched_at: now_ms(),
-                    note: "via Antigravity CLI".into(),
-                    ..Default::default()
-                },
-                Err(error) => UsageSnapshot {
-                    status: if previous.windows.is_empty() {
-                        "error".into()
-                    } else {
-                        "stale".into()
-                    },
-                    note: format!(
-                        "via Antigravity CLI — {error}.{}",
-                        if previous.windows.is_empty() {
-                            ""
-                        } else {
-                            " Last reading kept."
-                        }
-                    ),
-                    ..previous
-                },
-            };
-
-            *st.antigravity.lock().unwrap() = snap.clone();
-            persist(&snap);
-            emit_snapshot(&app, snap);
-        }
-    });
-
-    request_refresh();
-}
-
-fn start_legacy(app: AppHandle) {
-    std::thread::spawn(move || {
-        {
-            emit_current(&app);
-        }
-        if !legacy_present() {
-            broadcast(&app, UsageSnapshot { status: "absent".into(), ..Default::default() });
-            loop {
-                sleep_interruptible(600);
-                if legacy_present() {
-                    break;
-                }
-            }
-        }
+        let mut was_cli = false;
         let mut rt = Runtime { endpoint: None, ever_bridged: false };
         loop {
-            let prev = {
-                let st = app.state::<AppState>();
-                let s = st.antigravity.lock().unwrap().clone();
-                s
-            };
-            let snap = read_once(&mut rt, &prev);
-            broadcast(&app, snap);
-            sleep_interruptible(POLL_SECS);
+            let cli_available = crate::agy_cli::find_agy().is_some();
+            let st = app.state::<AppState>();
+            let previous = st.antigravity.lock().unwrap().clone();
+            if cli_available != was_cli {
+                last_attempt = None;
+                rt = Runtime { endpoint: None, ever_bridged: false };
+            }
+            was_cli = cli_available;
+            if cli_available {
+                if cli_due(&previous, last_attempt) {
+                    last_attempt = Some(Instant::now());
+                    let snap = match crate::agy_cli::read_quota() {
+                        Ok(windows) => UsageSnapshot {
+                            status: "ok".into(),
+                            windows,
+                            fetched_at: now_ms(),
+                            note: "via Antigravity CLI".into(),
+                            ..Default::default()
+                        },
+                        Err(error) => UsageSnapshot {
+                            status: if previous.windows.is_empty() {
+                                "error".into()
+                            } else {
+                                "stale".into()
+                            },
+                            note: format!(
+                                "via Antigravity CLI — {error}.{}",
+                                if previous.windows.is_empty() {
+                                    ""
+                                } else {
+                                    " Last reading kept."
+                                }
+                            ),
+                            ..previous.clone()
+                        },
+                    };
+                    broadcast(&app, snap);
+                }
+            } else if legacy_present() {
+                broadcast(&app, read_once(&mut rt, &previous));
+            } else {
+                broadcast(&app, UsageSnapshot { status: "absent".into(), ..Default::default() });
+            }
+            let active = !app.state::<AppState>().store.lock().unwrap()
+                .snapshot("en", "en", false, false).sessions.is_empty();
+            let wait = poll_period(active);
+            let _ = receiver.recv_timeout(Duration::from_secs(wait));
         }
     });
+}
+
+fn poll_period(active: bool) -> u64 {
+    if active { POLL_ACTIVE_SECS } else { POLL_IDLE_SECS }
+}
+
+fn cli_due(previous: &UsageSnapshot, last_attempt: Option<Instant>) -> bool {
+    let cached = previous.note.starts_with("via Antigravity CLI")
+        && !previous.windows.is_empty()
+        && now_ms().saturating_sub(previous.fetched_at) < CLI_TTL.as_millis() as u64;
+    !cached && !last_attempt.is_some_and(|last| last.elapsed() < CLI_TTL)
 }
 
 /// For doctor: contains no secrets
@@ -843,8 +803,22 @@ fn legacy_probe() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{requests_in, state_roots_in};
+    use super::{cli_due, poll_period, requests_in, state_roots_in, UsageSnapshot, LimitWindow, CLI_TTL};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn cli_polling_period_and_ttl_gate() {
+        assert_eq!(poll_period(true), 60);
+        assert_eq!(poll_period(false), 300);
+        let fresh = UsageSnapshot {
+            windows: vec![LimitWindow { id: "quota".into(), ..Default::default() }],
+            fetched_at: super::now_ms(), note: "via Antigravity CLI".into(), ..Default::default()
+        };
+        assert!(!cli_due(&fresh, None));
+        assert!(!cli_due(&UsageSnapshot::default(), Some(std::time::Instant::now())));
+        assert!(cli_due(&UsageSnapshot::default(), Some(std::time::Instant::now() - CLI_TTL)));
+        assert!(cli_due(&UsageSnapshot::default(), None));
+    }
 
     struct Home(PathBuf);
     impl Home {

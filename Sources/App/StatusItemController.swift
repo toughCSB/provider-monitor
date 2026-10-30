@@ -139,8 +139,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// same three facts the tooltip header shows. Clicking re-reads it.
     private func headerItem(for snapshot: ProviderSnapshot, now: Date) -> NSMenuItem {
         var title = "\(snapshot.displayName) — \(Self.headline(for: snapshot))"
-        if snapshot.kind == .usage, let since = snapshot.status.staleSince, since != .distantPast {
-            title += " · \(ElapsedCopy.ago(since: since, now: now))"
+        if let note = snapshot.readingNote(at: now) {
+            title += " · \(note)"
         }
         let header = NSMenuItem(title: title, action: #selector(refreshProvider(_:)), keyEquivalent: "")
         header.target = self
@@ -174,14 +174,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             return snapshot.localRuntime == nil ? [snapshot.statusMessage].compactMap { $0 } : []
         }
         if let block = snapshot.block {
-            var lines = [block.summary(now: now)]
+            var lines = [snapshot.connectionFailure?.message(at: now), block.summary(now: now)].compactMap { $0 }
             lines += snapshot.windows.map { windowLine(for: $0, now: now) }
             return lines
         }
         if let message = snapshot.statusMessage {
             return [message]
         }
-        return snapshot.windows.map { windowLine(for: $0, now: now) }
+        return [snapshot.connectionFailure?.message(at: now)].compactMap { $0 }
+            + snapshot.windows.map { windowLine(for: $0, now: now) }
     }
 
     /// One loaded model on one line: what its cell prints, what it is doing,

@@ -134,11 +134,7 @@ pub fn probe() -> String {
         return format!("Cursor: {} not found (not installed, or not signed in)", p.display());
     }
     match read_credentials() {
-        Some(c) => format!(
-            "Cursor: session borrowed (cookie {} chars, plan={})",
-            c.cookie.len(),
-            c.plan.unwrap_or_else(|| "?".into())
-        ),
+        Some(c) => format!("Cursor: session borrowed (plan={})", c.plan.unwrap_or_else(|| "?".into())),
         None => format!("Cursor: {} exists but cursorAuth/* could not be read (editor not signed in, or SQLite failed to open)", p.display()),
     }
 }

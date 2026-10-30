@@ -23,6 +23,7 @@ struct UsageArchive {
         /// continue to open and show their last quota reading.
         let tokenUsage: CodexTokenUsage?
         let usageDetail: ProviderUsageDetail?
+        let observation: UsageObservation?
     }
 
     private let defaults: UserDefaults
@@ -95,7 +96,8 @@ struct UsageArchive {
                 headlineID: entry.headlineID,
                 weeklyID: entry.weeklyID,
                 tokenUsage: entry.tokenUsage,
-                usageDetail: entry.usageDetail
+                usageDetail: entry.usageDetail,
+                observation: entry.observation
             )
             result[entry.id] = (snapshot, entry.fetchedAt)
         }
@@ -121,7 +123,8 @@ struct UsageArchive {
                 headlineID: $0.snapshot.headlineID,
                 weeklyID: $0.snapshot.weeklyID,
                 tokenUsage: $0.snapshot.tokenUsage,
-                usageDetail: $0.snapshot.usageDetail
+                usageDetail: $0.snapshot.usageDetail,
+                observation: $0.snapshot.observation
             )
         }
         guard let data = try? JSONEncoder().encode(entries) else { return }

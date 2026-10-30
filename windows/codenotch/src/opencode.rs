@@ -100,7 +100,7 @@ pub fn probe() -> String {
         return format!("OpenCode: {} not found (not installed, or Go not connected)", p.display());
     }
     match load_token() {
-        Some(t) => format!("OpenCode: opencode-go key found ({} chars)", t.len()),
+        Some(_) => "OpenCode: opencode-go key found".into(),
         None => format!("OpenCode: {} exists but has no opencode-go entry (connect Go with `opencode auth login`)", p.display()),
     }
 }
@@ -113,20 +113,13 @@ enum FetchErr {
 }
 
 fn retry_after_secs(resp: &ureq::Response) -> Option<u64> {
-    let header = resp.header("retry-after")?.trim();
-    if let Ok(secs) = header.parse::<u64>() {
-        return Some(secs);
-    }
-    chrono::DateTime::parse_from_rfc2822(header)
-        .ok()
-        .map(|d| (d.timestamp_millis() - now_ms() as i64).max(0) as u64 / 1000)
+    crate::polling::retry_after_hint_secs(resp.header("retry-after"), now_ms())
 }
 
-/// A minute, doubling per consecutive limit, capped so it always recovers on its own. The server's
-/// own hint only raises the floor, never lowers it.
+/// A minute, doubling per consecutive limit, is the floor under any server hint.
 fn backoff_secs(consecutive: u32, retry_after: Option<u64>) -> u64 {
     let doubled = BACKOFF_BASE_SECS.saturating_mul(1u64 << consecutive.min(4));
-    doubled.clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS).max(retry_after.unwrap_or(0))
+    crate::polling::backoff_secs(doubled.clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS), retry_after)
 }
 
 fn fetch_usage(token: &str, consecutive_429: u32) -> Result<serde_json::Value, FetchErr> {
@@ -215,7 +208,7 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
         }
         Err(FetchErr::RateLimited(secs)) => {
             CONSECUTIVE_429.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            snap.backoff_until = now_ms() + secs * 1000;
+            snap.backoff_until = crate::polling::deadline_ms(now_ms(), secs);
             if !snap.windows.is_empty() {
                 snap.status = "stale".into();
             }
@@ -269,12 +262,12 @@ pub fn start(app: AppHandle) {
                 s
             };
             let snap = read_once(&prev);
-            let hold = snap.backoff_until.saturating_sub(now_ms()) / 1000;
+            let deadline = snap.backoff_until;
             if snap.status == "error" || snap.status == "stale" {
                 crate::applog(&format!("opencode: {}", snap.note));
             }
             broadcast(&app, snap);
-            sleep_interruptible(POLL_SECS.max(hold));
+            sleep_interruptible(crate::polling::poll_wait_secs(POLL_SECS, deadline, now_ms()));
         }
     });
 }
@@ -282,6 +275,12 @@ pub fn start(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_retry_hint_never_shortens_local_exponential_delay() {
+        assert_eq!(backoff_secs(3, None), 480);
+        assert_eq!(backoff_secs(3, Some(2)), 480);
+    }
 
     fn windows(json: &str) -> Vec<LimitWindow> {
         windows_from_usage(&serde_json::from_str(json).unwrap())

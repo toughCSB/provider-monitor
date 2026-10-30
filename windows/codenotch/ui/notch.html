@@ -716,7 +716,7 @@ function renderCard(){
     }
   }
   html+=limitRowHtml(p.id);
-  if(staleOf(snap)&&snap.fetched_at) html+=`<div class="c-sub">${textCopy('Updated')} ${ago(snap.fetched_at)}</div>`;
+  if(snap.fetched_at) html+=`<div class="c-sub">${textCopy('Updated')} ${ago(snap.fetched_at)}</div>`;
   if(snap.status==='needsAuth'){
     const who={claude:'Sign in to Claude Code to see usage.',cursor:'Sign in to Cursor to see usage.',codex:'Sign in to Codex to see usage.',gemini:'Sign in to Antigravity to see usage.',grok:'Sign in to Grok to see usage.',opencode:'Sign in to OpenCode to see usage.',glm:'Sign in to GLM Code to see usage.',devin:'Sign in to Devin to see usage.',commandcode:'Sign in to Command Code to see usage.',kimi:'Sign in to Kimi Code to see usage.',copilot:'Sign in to GitHub Copilot to see usage.',kiro:'Sign in to Kiro to see usage.'}[p.id]||'';
     html+=`<div class="c-note">${textCopy(who)}<br>${esc(textCopy(snap.note||''))}</div>`;

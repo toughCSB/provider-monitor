@@ -14,6 +14,15 @@ RESOLVED_PACKAGES := $(PROJECT)/project.xcworkspace/xcshareddata/swiftpm/Package
 ARCH    ?= $(shell uname -m)
 DEST    ?= platform=macOS,arch=$(ARCH)
 TEST_DERIVED := $(CURDIR)/build/TestDerivedData.noindex
+# Where `build` and `install` put their products. Inside the repo rather than
+# Xcode's own DerivedData folder for one measured reason: Spotlight offers every
+# built copy as a second installed app beside /Applications/Provider Monitor.app,
+# so a few `make install` runs leave a row of identical icons wherever the user
+# searches. `.metadata_never_index` was tried in the DerivedData root and did
+# not take effect on a folder the indexer already knew, while the `*.noindex`
+# suffix under `build/` — which the test build below has always used — was not
+# indexed once in three builds. `make clean` removes it with the rest of build/.
+LOCAL_DERIVED := $(CURDIR)/build/local/DerivedData.noindex
 
 # Debug signs itself when the maintainer's Developer ID certificate isn't in
 # the keychain, which is every machine but the maintainer's — so a contributor
@@ -66,6 +75,7 @@ gen:
 
 build: gen
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
+		-derivedDataPath '$(LOCAL_DERIVED)' \
 		-configuration Debug $(DEV_SIGN) build
 
 test: gen
@@ -118,9 +128,11 @@ install: gen
 			'</dict></plist>' > "$(LOCAL_INSTALL_ENTITLEMENTS)"; \
 	fi
 	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
+		-derivedDataPath '$(LOCAL_DERIVED)' \
 		-configuration Release $(DEV_SIGN) \
 		$(if $(LOCAL_INSTALL_ADHOC),CODE_SIGN_ENTITLEMENTS="$(LOCAL_INSTALL_ENTITLEMENTS)") build
 	@APP="$$(xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
+		-derivedDataPath '$(LOCAL_DERIVED)' \
 		-configuration Release -showBuildSettings 2>/dev/null \
 		| awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $$2; exit}')/$(APP_BUNDLE)"; \
 	if [ "$(LOCAL_INSTALL_ADHOC)" = "1" ]; then \
@@ -257,7 +269,7 @@ verify-release:
 # token prompt comes back after every single update, which is exactly what
 # project.yml's stable identity exists to prevent.
 CI_DIR     := build/ci
-CI_DERIVED := $(CI_DIR)/DerivedData
+CI_DERIVED := $(CI_DIR)/DerivedData.noindex
 CI_APP     := $(CI_DERIVED)/Build/Products/Release/$(APP_BUNDLE)
 CI_DMG     := $(CI_DIR)/$(APP_NAME)-$(VERSION)-unsigned.dmg
 # Absolute: xcodebuild resolves CODE_SIGN_ENTITLEMENTS against the project

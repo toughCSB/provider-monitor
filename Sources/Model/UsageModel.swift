@@ -356,6 +356,18 @@ struct ProviderSnapshot: Identifiable, Equatable {
     /// breakdown and daily token/cost series.
     var usageDetail: ProviderUsageDetail? = nil
 
+    /// Original measurement time and source, not the time a cache was polled.
+    var observation: UsageObservation? = nil
+    /// The latest connection result, independent of the age of retained numbers.
+    var connectionFailure: UsageFailure? = nil
+
+    func readingNote(at now: Date) -> String? {
+        guard kind == .usage, hasReading else { return nil }
+        if let observation { return observation.note(at: now) }
+        guard let since = status.staleSince, since != .distantPast else { return nil }
+        return ElapsedCopy.ago(since: since, now: now)
+    }
+
     /// The number on the cell: the provider's declared primary window — for
     /// Claude, the current session.
     ///

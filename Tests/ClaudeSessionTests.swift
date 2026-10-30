@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import ProviderMonitor
 
@@ -233,6 +234,80 @@ final class ClaudeSessionStateSourceTests: XCTestCase {
         let a = try record(#"{ "pid": 1, "cwd": "/tmp/x" }"#)
         let b = try record(#"{ "pid": 2, "cwd": "/tmp/x" }"#)
         XCTAssertEqual(ClaudeSessionMonitor.deduplicated([a, b]).count, 2)
+    }
+}
+
+@MainActor
+final class ClaudeSessionWatcherTests: XCTestCase {
+    private var root: URL!
+
+    private func waitForWatcher(_ monitor: ClaudeSessionMonitor) -> Bool {
+        let deadline = Date().addingTimeInterval(1)
+        while !monitor.isWatchingCurrentDirectory && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        return monitor.isWatchingCurrentDirectory
+    }
+
+    override func setUpWithError() throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("session-watcher-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testWatcherRecoversWhenDirectoryAppearsAndIsReplaced() throws {
+        let directory = root.appendingPathComponent("sessions")
+        let monitor = ClaudeSessionMonitor(directory: directory, livenessInterval: 60)
+        monitor.start()
+        defer { monitor.stop() }
+        XCTAssertFalse(monitor.isWatchingCurrentDirectory)
+
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        monitor.refreshDirectoryWatcher()
+        XCTAssertTrue(monitor.isWatchingCurrentDirectory)
+
+        try FileManager.default.moveItem(at: directory,
+                                         to: root.appendingPathComponent("old-sessions"))
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        XCTAssertFalse(monitor.isWatchingCurrentDirectory)
+        monitor.refreshDirectoryWatcher()
+        XCTAssertTrue(monitor.isWatchingCurrentDirectory)
+
+        monitor.stop()
+        monitor.stop()
+        XCTAssertFalse(monitor.isWatchingCurrentDirectory)
+    }
+
+    func testWakeReattachesWatcherAndStopRemovesObserver() throws {
+        let directory = root.appendingPathComponent("sessions")
+        let monitor = ClaudeSessionMonitor(directory: directory, livenessInterval: 60)
+        monitor.start()
+        defer { monitor.stop() }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification,
+                                                   object: nil)
+        XCTAssertTrue(waitForWatcher(monitor))
+
+        try FileManager.default.moveItem(at: directory,
+                                         to: root.appendingPathComponent("old-sessions"))
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        XCTAssertFalse(monitor.isWatchingCurrentDirectory)
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification,
+                                                   object: nil)
+        XCTAssertTrue(waitForWatcher(monitor))
+
+        monitor.stop()
+        try FileManager.default.moveItem(at: directory,
+                                         to: root.appendingPathComponent("new-sessions"))
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.didWakeNotification,
+                                                   object: nil)
+        XCTAssertFalse(monitor.isWatchingCurrentDirectory)
     }
 }
 

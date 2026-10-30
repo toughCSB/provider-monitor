@@ -31,6 +31,30 @@ fn age_secs(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
+fn usage_line(name: &str, source: &str, snap: &crate::usage::UsageSnapshot) -> String {
+    // Only a fixed source label and timestamps are printed: provider notes can contain
+    // server text, paths, or account information and must not enter doctor output.
+    let status = match snap.status.as_str() {
+        "ok" | "stale" | "needsAuth" | "backoff" | "error" | "none" | "absent" => snap.status.as_str(),
+        _ => "unknown",
+    };
+    let failure = match status {
+        "error" => "error",
+        "needsAuth" => "auth",
+        "backoff" => "rate-limit",
+        "stale" if snap.backoff_until > std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) => "rate-limited-or-stale",
+        "stale" => "stale",
+        _ => "none",
+    };
+    format!(
+        "  {name}: status={} source={source} measured_at_ms={} failure={failure} next_retry_ms={}\n",
+        status,
+        snap.fetched_at,
+        snap.backoff_until,
+    )
+}
+
 pub fn run() -> String {
     let mut o = String::new();
     o += &format!("== Provider Monitor doctor v{} ==\n", env!("CARGO_PKG_VERSION"));
@@ -86,6 +110,23 @@ pub fn run() -> String {
     o += &format!("  {}\n", crate::kimi::probe());
     o += &format!("  {}\n", crate::copilot::probe());
     o += &format!("  {}\n", crate::kiro::probe());
+    o += "\nlast persisted usage (timestamps are epoch milliseconds; 0 means unknown):\n";
+    for (name, source, snap) in [
+        ("Claude", "OAuth API", crate::usage::load_persisted()),
+        ("Codex", "live API or rollout", crate::codex::load_persisted()),
+        ("Cursor", "local adapter", crate::cursor::load_persisted()),
+        ("Antigravity", "CLI or legacy", crate::antigravity::load_persisted()),
+        ("Grok", "CLI auth and API", crate::grok::load_persisted()),
+        ("OpenCode", "Go API", crate::opencode::load_persisted()),
+        ("GLM", "coding plan API", crate::glm::load_persisted()),
+        ("Devin", "quota API", crate::devin::load_persisted()),
+        ("Command Code", "quota API", crate::command_code::load_persisted()),
+        ("Kimi", "OAuth API", crate::kimi::load_persisted()),
+        ("Copilot", "GitHub API", crate::copilot::load_persisted()),
+        ("Kiro", "CLI and optional limits", crate::kiro::load_persisted()),
+    ] {
+        o += &usage_line(name, source, &snap);
+    }
     o += &format!("\nprovider glyphs:\n{}\n", crate::glyphs::probe());
     o += &format!("\nworking state:\n  {}\n", crate::activity::probe());
 
@@ -102,4 +143,22 @@ pub fn run() -> String {
         }
     }
     o
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_exclude_untrusted_notes_and_account_data() {
+        let snap = crate::usage::UsageSnapshot {
+            status: "stale".into(), fetched_at: 123, backoff_until: 456,
+            note: "secret account@example.com transcript".into(), ..Default::default()
+        };
+        let line = usage_line("Codex", "live API or rollout", &snap);
+        assert!(line.contains("measured_at_ms=123"));
+        assert!(line.contains("next_retry_ms=456"));
+        assert!(!line.contains("account@example.com"));
+        assert!(!line.contains("transcript"));
+    }
 }

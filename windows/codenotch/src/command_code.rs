@@ -116,13 +116,7 @@ pub fn probe() -> String {
         );
     }
     match load_credential() {
-        Some(credential) => format!(
-            "Command Code: auth.json usable{}",
-            credential
-                .user_name
-                .map(|name| format!(", account={name}"))
-                .unwrap_or_default()
-        ),
+        Some(_) => "Command Code: auth.json usable".into(),
         None => format!("Command Code: {} has no usable apiKey", path.display()),
     }
 }
@@ -134,11 +128,7 @@ enum FetchErr {
 }
 
 fn retry_after_secs(response: &ureq::Response) -> u64 {
-    response
-        .header("retry-after")
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(0)
-        .max(BACKOFF_MIN_SECS)
+    crate::polling::retry_after_secs(response.header("retry-after"), now_ms(), BACKOFF_MIN_SECS)
 }
 
 fn fetch_json(
@@ -346,7 +336,7 @@ fn read_once(previous: &UsageSnapshot) -> UsageSnapshot {
                     .into();
         }
         Err(FetchErr::RateLimited(seconds)) => {
-            snapshot.backoff_until = now_ms() + seconds * 1000;
+            snapshot.backoff_until = crate::polling::deadline_ms(now_ms(), seconds);
             snapshot.status = if snapshot.windows.is_empty() {
                 "backoff"
             } else {
@@ -413,12 +403,12 @@ pub fn start(app: AppHandle) {
                 snapshot
             };
             let snapshot = read_once(&previous);
-            let hold = snapshot.backoff_until.saturating_sub(now_ms()) / 1000;
+            let deadline = snapshot.backoff_until;
             if snapshot.status == "error" || snapshot.status == "stale" {
                 crate::applog(&format!("commandcode: {}", snapshot.note));
             }
             broadcast(&app, snapshot);
-            sleep_interruptible(POLL_SECS.max(hold));
+            sleep_interruptible(crate::polling::poll_wait_secs(POLL_SECS, deadline, now_ms()));
         }
     });
 }

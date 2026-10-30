@@ -393,26 +393,11 @@ actor MiniMaxProvider: UsageProvider {
     /// limit, capped so it always recovers on its own. The server's own hint
     /// is honoured only as a floor-raiser.
     static func backoff(forAttempt attempt: Int, retryAfter: TimeInterval?) -> TimeInterval {
-        let floor: TimeInterval = 60
-        let ceiling: TimeInterval = 15 * 60
-        let doubled = floor * pow(2, Double(min(attempt, 4)))
-        return min(ceiling, max(doubled, retryAfter ?? 0))
+        UsageRetryPolicy.backoff(attempt: attempt, retryAfter: retryAfter)
     }
 
     /// `Retry-After` is either a number of seconds or an HTTP date.
     static func retryAfter(from response: URLResponse?) -> TimeInterval? {
-        guard let header = (response as? HTTPURLResponse)?
-            .value(forHTTPHeaderField: "Retry-After")?
-            .trimmingCharacters(in: .whitespaces)
-        else { return nil }
-
-        if let seconds = TimeInterval(header) { return max(0, seconds) }
-
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "GMT")
-        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        guard let date = formatter.date(from: header) else { return nil }
-        return max(0, date.timeIntervalSinceNow)
+        UsageRetryPolicy.retryAfter(from: response)
     }
 }

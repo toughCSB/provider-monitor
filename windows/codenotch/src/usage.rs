@@ -4,7 +4,7 @@
 //! Rules (upstream's discipline):
 //!   - the credential comes from Claude Code's own store (Windows: ~/.claude/.credentials.json), read only
 //!   - 401/403 → re-read the credential once and retry (Claude Code may have just refreshed the token) → still failing means needsAuth
-//!   - 429 → back off 60 s × 2^n capped at 15 min, Retry-After only raises it, even past the cap; the deadline is persisted
+//!   - 429 → back off 60 s × 2^n capped at 15 min; Retry-After can extend that wait past the cap; the deadline is persisted
 //!   - an expired token is never sent: the endpoint answers it with 429 + Retry-After ≈ 3600, not 401, so sending it
 //!     reads as "rate limited" for as long as the token stays stale (upstream's credentialExpired, no network)
 //!   - the token is renewed by running the standalone `claude -p` with an empty stdin shortly before it expires
@@ -150,8 +150,7 @@ pub fn probe_credentials() -> String {
     };
     match read_credentials() {
         Some(c) => format!(
-            "credential: found (token {} chars, {}; {cli})",
-            c.token.len(),
+            "credential: found ({}; {cli})",
             if c.expired(now_ms()) { "expired" } else { "valid" }
         ),
         None => "credential: ~/.claude/.credentials.json not found (needsAuth; the desktop app may use another store — signing in once with the Claude Code CLI creates it)".into(),
@@ -192,23 +191,11 @@ fn find_cli() -> Option<std::path::PathBuf> {
 }
 
 /// Whether a launch is worth making. Pure, so every branch is testable without a clock or a subprocess
-fn should_renew(expires_at: Option<u64>, now: u64, attempted_for: Option<u64>, last_attempt: Option<u64>) -> bool {
+fn should_renew(expires_at: Option<u64>, now: u64) -> bool {
     // Nothing read yet: never launch on a guess
     let Some(exp) = expires_at else { return false };
     // Plenty of time left — also where launching would do nothing, because the CLI's own gate has not opened
-    if exp > now + RENEW_MARGIN_MS {
-        return false;
-    }
-    // One attempt per token: a launch that failed to move the expiry leaves the same value here, and never runs again
-    if attempted_for == Some(exp) {
-        return false;
-    }
-    if let Some(t) = last_attempt {
-        if now.saturating_sub(t) < RENEW_COOLDOWN_MS {
-            return false;
-        }
-    }
-    true
+    exp <= now.saturating_add(RENEW_MARGIN_MS)
 }
 
 /// `claude -p` with a null stdin starts up (which is where it renews an aged token), then exits non-zero for want
@@ -244,8 +231,7 @@ fn run_renewal(cli: &std::path::Path) -> std::io::Result<()> {
 
 #[derive(Default)]
 struct Renewer {
-    attempted_for: Option<u64>,
-    last_attempt: Option<u64>,
+    budget: crate::polling::RenewalBudget,
 }
 
 impl Renewer {
@@ -253,11 +239,9 @@ impl Renewer {
     /// exit status, because refusing the empty prompt is a non-zero exit and a successful renewal at the same time
     fn maybe_renew(&mut self, cred: &Credential) -> Option<bool> {
         let now = now_ms();
-        if !should_renew(cred.expires_at, now, self.attempted_for, self.last_attempt) {
+        if !self.budget.claim(cred.expires_at, now, should_renew(cred.expires_at, now), RENEW_COOLDOWN_MS) {
             return None;
         }
-        self.last_attempt = Some(now);
-        self.attempted_for = cred.expires_at;
         let Some(cli) = find_cli() else {
             crate::applog("claude: token about to expire and no standalone claude CLI found to renew it");
             return Some(false);
@@ -268,6 +252,9 @@ impl Renewer {
         }
         let after = read_credentials().and_then(|c| c.expires_at);
         let renewed = matches!((after, cred.expires_at), (Some(a), Some(b)) if a > b);
+        if renewed {
+            self.budget.finish_for_current_expiry();
+        }
         crate::applog(&if renewed {
             format!("claude: token renewed via {}", cli.display())
         } else {
@@ -355,7 +342,7 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
 
 enum FetchErr {
     NeedsAuth,
-    RateLimited(u64), // suggested wait in seconds (the Retry-After before the floor is applied)
+    RateLimited(Option<u64>),
     Other(String),
 }
 
@@ -376,10 +363,7 @@ fn fetch_once(token: &str) -> Result<Vec<LimitWindow>, FetchErr> {
             Err(FetchErr::NeedsAuth)
         }
         Err(ureq::Error::Status(429, r)) => {
-            let ra = r
-                .header("retry-after")
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+            let ra = crate::polling::retry_after_hint_secs(r.header("retry-after"), now_ms());
             Err(FetchErr::RateLimited(ra))
         }
         Err(ureq::Error::Status(code, _)) => Err(FetchErr::Other(format!("HTTP {code}"))),
@@ -387,11 +371,9 @@ fn fetch_once(token: &str) -> Result<Vec<LimitWindow>, FetchErr> {
     }
 }
 
-fn backoff_secs(consecutive: u32, retry_after_floor: u64) -> u64 {
+fn backoff_secs(consecutive: u32, retry_after: Option<u64>) -> u64 {
     let exp = BACKOFF_BASE_SECS.saturating_mul(1u64 << consecutive.min(4));
-    // The server's Retry-After is honoured in full: with expired tokens no longer
-    // sent, a long one is a real rate limit, and retrying early only earns another.
-    exp.clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS).max(retry_after_floor)
+    crate::polling::backoff_secs(exp.clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS), retry_after)
 }
 
 fn set_and_broadcast(app: &AppHandle, mutate: impl FnOnce(&mut UsageSnapshot)) {
@@ -431,7 +413,7 @@ pub fn start(app: AppHandle) {
             };
             let now = now_ms();
             if bu > now {
-                sleep_interruptible(((bu - now) / 1000).clamp(1, 30));
+                sleep_interruptible(crate::polling::remaining_secs(bu, now).clamp(1, 30));
                 continue;
             }
             match read_credentials() {
@@ -478,7 +460,7 @@ pub fn start(app: AppHandle) {
                                     u.status = "stale".into();
                                 }
                                 u.note = format!("Rate limited, retrying in {wait}s");
-                                u.backoff_until = now_ms() + wait * 1000;
+                                u.backoff_until = crate::polling::deadline_ms(now_ms(), wait);
                             });
                         }
                         Err(FetchErr::Other(msg)) => set_and_broadcast(&app, |u| {
@@ -499,11 +481,13 @@ pub fn start(app: AppHandle) {
                 let s = store.snapshot("en", "en", false, false);
                 !s.sessions.is_empty()
             };
-            sleep_interruptible(if active {
+            let period = if active {
                 POLL_ACTIVE_SECS
             } else {
                 POLL_IDLE_SECS
-            });
+            };
+            let deadline = app.state::<AppState>().usage.lock().unwrap().backoff_until;
+            sleep_interruptible(crate::polling::poll_wait_secs(period, deadline, now_ms()));
         }
     });
 }
@@ -516,26 +500,30 @@ mod tests {
 
     #[test]
     fn renews_only_inside_the_margin() {
-        assert!(!should_renew(None, EXP, None, None), "never launch on a guess");
-        assert!(!should_renew(Some(EXP), EXP - RENEW_MARGIN_MS - 1, None, None), "plenty of time left");
-        assert!(should_renew(Some(EXP), EXP - RENEW_MARGIN_MS, None, None));
-        assert!(should_renew(Some(EXP), EXP + 3_600_000, None, None), "already expired still renews");
+        assert!(!should_renew(None, EXP));
+        assert!(!should_renew(Some(EXP), EXP - RENEW_MARGIN_MS - 1));
+        assert!(should_renew(Some(EXP), EXP - RENEW_MARGIN_MS));
+        assert!(should_renew(Some(EXP), EXP + 3_600_000));
     }
 
     #[test]
-    fn one_attempt_per_token_and_a_cooldown() {
-        let now = EXP + 1;
-        assert!(!should_renew(Some(EXP), now, Some(EXP), None), "same token is never retried");
-        assert!(!should_renew(Some(EXP + 5), now, Some(EXP), Some(now - 1000)), "cooldown holds a new token back");
-        assert!(should_renew(Some(EXP + 5), now, Some(EXP), Some(now - RENEW_COOLDOWN_MS)));
+    fn renewal_budget_allows_three_spaced_attempts() {
+        let mut budget = crate::polling::RenewalBudget::default();
+        assert!(budget.claim(Some(EXP), EXP, should_renew(Some(EXP), EXP), RENEW_COOLDOWN_MS));
+        assert!(!budget.claim(Some(EXP), EXP + 1, true, RENEW_COOLDOWN_MS));
+        assert!(budget.claim(Some(EXP), EXP + RENEW_COOLDOWN_MS, true, RENEW_COOLDOWN_MS));
+        assert!(budget.claim(Some(EXP), EXP + 2 * RENEW_COOLDOWN_MS, true, RENEW_COOLDOWN_MS));
+        assert!(!budget.claim(Some(EXP), EXP + 3 * RENEW_COOLDOWN_MS, true, RENEW_COOLDOWN_MS));
+        assert!(budget.claim(Some(EXP + 1), EXP + 3 * RENEW_COOLDOWN_MS, true, RENEW_COOLDOWN_MS));
     }
 
     #[test]
-    fn retry_after_never_exceeds_the_cap() {
-        assert_eq!(backoff_secs(0, 3600), 3600);
-        assert_eq!(backoff_secs(0, 0), BACKOFF_BASE_SECS);
-        assert_eq!(backoff_secs(1, 300), 300);
-        assert_eq!(backoff_secs(9, 0), BACKOFF_CAP_SECS);
+    fn retry_after_extends_but_never_shortens_local_backoff() {
+        assert_eq!(backoff_secs(0, Some(3600)), 3600);
+        assert_eq!(backoff_secs(0, Some(2)), BACKOFF_BASE_SECS);
+        assert_eq!(backoff_secs(0, Some(0)), BACKOFF_BASE_SECS);
+        assert_eq!(backoff_secs(0, None), BACKOFF_BASE_SECS);
+        assert_eq!(backoff_secs(9, None), BACKOFF_CAP_SECS);
     }
 
     #[test]

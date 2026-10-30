@@ -723,20 +723,14 @@ fn endpoint_for_arn(arn: &str) -> Option<&'static str> {
 }
 
 fn retry_after_secs(response: &ureq::Response) -> Option<u64> {
-    let header = response.header("retry-after")?.trim();
-    if let Ok(seconds) = header.parse::<u64>() {
-        return Some(seconds);
-    }
-    chrono::DateTime::parse_from_rfc2822(header)
-        .ok()
-        .map(|date| (date.timestamp_millis() - now_ms() as i64).max(0) as u64 / 1000)
+    crate::polling::retry_after_hint_secs(response.header("retry-after"), now_ms())
 }
 
 fn backoff_secs(attempt: u32, retry_after: Option<u64>) -> u64 {
-    BACKOFF_BASE_SECS
+    let local = BACKOFF_BASE_SECS
         .saturating_mul(1_u64 << attempt.min(4))
-        .clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS)
-        .max(retry_after.unwrap_or(0))
+        .clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS);
+    crate::polling::backoff_secs(local, retry_after)
 }
 
 enum EnrichResult {
@@ -825,7 +819,7 @@ fn maybe_enrich(reading: &mut Reading, held_until: u64) -> u64 {
         }
         EnrichResult::RateLimited(seconds) => {
             CONSECUTIVE_429.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            now_ms() + seconds * 1000
+            crate::polling::deadline_ms(now_ms(), seconds)
         }
         EnrichResult::Unavailable => 0,
     }
@@ -1098,6 +1092,7 @@ mod tests {
         assert_eq!(backoff_secs(3, None), 480);
         assert_eq!(backoff_secs(8, None), 900);
         assert_eq!(backoff_secs(0, Some(1200)), 1200);
+        assert_eq!(backoff_secs(3, Some(2)), 480);
     }
 
     #[test]

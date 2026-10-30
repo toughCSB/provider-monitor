@@ -19,8 +19,8 @@ import Foundation
 /// The gate is exact, and it is why this asks so late. A session with sixty
 /// seconds left is left alone; one that expired sixty seconds ago is renewed on
 /// the spot. The margin is therefore zero rather than a few minutes: asking
-/// earlier is a launch the CLI answers with no change at all, which this would
-/// then correctly judge a failure and stop retrying.
+/// earlier is a launch the CLI answers with no change at all. The zero margin
+/// prevents spending one of the bounded attempts before the CLI can renew.
 ///
 /// This app never performs the OIDC refresh itself. It rotates the stored refresh
 /// token, and a second writer would race the CLI for the file.
@@ -63,11 +63,7 @@ final class GrokTokenRefresher: ObservableObject {
     /// first `await` — set any later, a second overlapping call would still see
     /// it as false and both would launch.
     var isRunningForTesting: Bool { isRunning }
-    private var lastAttempt: Date?
-    /// The expiry a launch was already spent on. One attempt per session, which
-    /// is what makes a failure stop instead of looping: a session that did not
-    /// renew has the same expiry next tick, and is refused.
-    private var attemptedFor: Date?
+    private var renewalPolicy = TokenRenewalPolicy()
 
     init(
         expiry: @escaping @MainActor () async -> Date?,
@@ -106,29 +102,6 @@ final class GrokTokenRefresher: ObservableObject {
 
     // MARK: - The gate
 
-    /// Whether a launch is worth making. Pure, so every branch is testable
-    /// without a clock or a subprocess.
-    static func shouldRenew(
-        expiry: Date?,
-        now: Date,
-        margin: TimeInterval,
-        attemptedFor: Date?,
-        lastAttempt: Date?,
-        cooldown: TimeInterval
-    ) -> Bool {
-        // Nothing read yet: never launch on a guess.
-        guard let expiry else { return false }
-        // Still live — which is also exactly where the command's own gate is
-        // shut, so a launch here would change nothing.
-        guard expiry.timeIntervalSince(now) < margin else { return false }
-        // Already spent an attempt on this exact session. This is the whole
-        // no-retry-loop guarantee: a launch that failed to move the expiry
-        // leaves the same value here next tick, and never runs again.
-        guard expiry != attemptedFor else { return false }
-        if let lastAttempt, now.timeIntervalSince(lastAttempt) < cooldown { return false }
-        return true
-    }
-
     func considerRenewing(now: Date = Date()) async {
         // Claimed here, synchronously, before anything is awaited: that is what
         // makes "at most one launch" true regardless of how two calls interleave.
@@ -137,20 +110,18 @@ final class GrokTokenRefresher: ObservableObject {
         defer { isRunning = false; launchedPID = nil }
 
         let current = await expiry()
-        guard Self.shouldRenew(expiry: current, now: now, margin: margin,
-                               attemptedFor: attemptedFor, lastAttempt: lastAttempt,
-                               cooldown: cooldown),
+        guard renewalPolicy.shouldAttempt(expiry: current, now: now, margin: margin,
+                                          cooldown: cooldown),
               let current
         else { return }
 
-        lastAttempt = now
-        attemptedFor = current
-
         guard let cli else {
+            renewalPolicy.finishForCurrentExpiry()
             fail("Grok's saved sign-in has expired and the `grok` command isn't "
                + "installed to renew it. Run `grok login` once to sign in again.")
             return
         }
+        renewalPolicy.recordAttempt(at: now)
         Log.usage.notice("grok session expired \(now.timeIntervalSince(current), format: .fixed(precision: 0))s ago; renewing via \(cli.path, privacy: .public)")
 
         let status: Int32?
@@ -171,6 +142,7 @@ final class GrokTokenRefresher: ObservableObject {
             Log.usage.error("grok token renewal ran (exit \(status ?? -1)) but the expiry did not move; still \(String(describing: after), privacy: .public)")
             return
         }
+        renewalPolicy.finishForCurrentExpiry()
         outcome = .refreshed(until: after)
         Log.usage.notice("grok session renewed, now expires \(after, privacy: .public)")
     }

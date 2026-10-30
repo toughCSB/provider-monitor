@@ -68,11 +68,10 @@ final class GrokTokenRefresherTests: XCTestCase {
     /// seconds out is untouched, one sixty seconds past is renewed on the spot —
     /// so asking earlier is a launch this would then have to report as a failure.
     func testItOnlyRunsAfterTheSessionHasExpired() {
+        var policy = TokenRenewalPolicy()
         func shouldRenew(_ remaining: TimeInterval) -> Bool {
-            GrokTokenRefresher.shouldRenew(
-                expiry: inSeconds(remaining), now: now, margin: 0,
-                attemptedFor: nil, lastAttempt: nil, cooldown: 600
-            )
+            policy.shouldAttempt(expiry: inSeconds(remaining), now: now,
+                                 margin: 0, cooldown: 600)
         }
         XCTAssertFalse(shouldRenew(6 * 3600), "hours of session left")
         XCTAssertFalse(shouldRenew(60), "a minute left is still a live session")
@@ -82,38 +81,36 @@ final class GrokTokenRefresherTests: XCTestCase {
 
     /// Never on a guess: no reading yet means no idea whether the session is live.
     func testItNeverRunsWithoutAnExpiry() {
-        XCTAssertFalse(GrokTokenRefresher.shouldRenew(
-            expiry: nil, now: now, margin: 0,
-            attemptedFor: nil, lastAttempt: nil, cooldown: 600
-        ))
+        var policy = TokenRenewalPolicy()
+        XCTAssertFalse(policy.shouldAttempt(expiry: nil, now: now,
+                                            margin: 0, cooldown: 600))
     }
 
-    /// The no-retry-loop guarantee, expressed as "one attempt per session"
-    /// rather than as a timer: a launch that failed to move the expiry leaves the
-    /// same value here on the next tick, so it is refused for as long as the
-    /// session stays expired — not merely for a cooldown.
-    func testASessionGetsOneAttemptEver() {
+    func testThePolicyBoundsRetriesPerExpiry() {
         let expiry = inSeconds(-60)
-        XCTAssertFalse(GrokTokenRefresher.shouldRenew(
-            expiry: expiry, now: now, margin: 0,
-            attemptedFor: expiry, lastAttempt: nil, cooldown: 600
-        ))
-        // A renewed session is a different question.
-        XCTAssertTrue(GrokTokenRefresher.shouldRenew(
-            expiry: inSeconds(-30), now: now, margin: 0,
-            attemptedFor: expiry, lastAttempt: nil, cooldown: 600
-        ))
+        var policy = TokenRenewalPolicy()
+        for attempt in 0..<TokenRenewalPolicy.maxAttempts {
+            let instant = now.addingTimeInterval(Double(attempt) * 600)
+            XCTAssertTrue(policy.shouldAttempt(expiry: expiry, now: instant,
+                                               margin: 0, cooldown: 600))
+            policy.recordAttempt(at: instant)
+        }
+        XCTAssertFalse(policy.shouldAttempt(expiry: expiry, now: inSeconds(1800),
+                                            margin: 0, cooldown: 600))
+        XCTAssertTrue(policy.shouldAttempt(expiry: inSeconds(-30), now: inSeconds(1800),
+                                           margin: 0, cooldown: 600))
     }
 
     func testTheCooldownHoldsOffASecondLaunch() {
-        XCTAssertFalse(GrokTokenRefresher.shouldRenew(
-            expiry: inSeconds(-60), now: now, margin: 0,
-            attemptedFor: nil, lastAttempt: now.addingTimeInterval(-60), cooldown: 600
-        ))
-        XCTAssertTrue(GrokTokenRefresher.shouldRenew(
-            expiry: inSeconds(-60), now: now, margin: 0,
-            attemptedFor: nil, lastAttempt: now.addingTimeInterval(-900), cooldown: 600
-        ))
+        var policy = TokenRenewalPolicy()
+        let expiry = inSeconds(-60)
+        XCTAssertTrue(policy.shouldAttempt(expiry: expiry, now: now,
+                                           margin: 0, cooldown: 600))
+        policy.recordAttempt(at: now)
+        XCTAssertFalse(policy.shouldAttempt(expiry: expiry, now: inSeconds(599),
+                                            margin: 0, cooldown: 600))
+        XCTAssertTrue(policy.shouldAttempt(expiry: expiry, now: inSeconds(600),
+                                           margin: 0, cooldown: 600))
     }
 
     // MARK: - Running it
@@ -216,9 +213,8 @@ final class GrokTokenRefresherTests: XCTestCase {
         }
     }
 
-    /// Nothing installed to renew with: the miss is reported rather than guessed
-    /// away, and reported once — the session's expiry has not moved, so the next
-    /// tick is refused by `attemptedFor` rather than nagging every minute.
+    /// Nothing installed to renew with: the miss is reported once for this
+    /// expiry rather than nagging on every tick.
     func testAMissingCommandFailsOnce() async {
         let stub = Stub(inSeconds(-60))
         let spy = Spy()
@@ -231,6 +227,42 @@ final class GrokTokenRefresherTests: XCTestCase {
         guard case .failed = refresher.outcome else {
             return XCTFail("expected a failure, got \(refresher.outcome)")
         }
+    }
+
+    func testFirstFailureThenCooldownThenSuccessDoesNotRepeat() async {
+        let before = inSeconds(-60)
+        let after = inSeconds(6 * 3600)
+        let stub = Stub(before)
+        let spy = Spy()
+        let refresher = refresher(stub: stub, spy: spy) {
+            if spy.launches == 2 { $0.value = after }
+        }
+
+        await refresher.considerRenewing(now: now)
+        await refresher.considerRenewing(now: inSeconds(599))
+        XCTAssertEqual(spy.launches, 1)
+        await refresher.considerRenewing(now: inSeconds(600))
+        XCTAssertEqual(refresher.outcome, .refreshed(until: after))
+        // A stale read of the old expiry must not spend another launch.
+        stub.value = before
+        await refresher.considerRenewing(now: inSeconds(1200))
+        XCTAssertEqual(spy.launches, 2)
+    }
+
+    func testThreeFailuresExhaustBudgetAndNewExpiryResetsIt() async {
+        let stub = Stub(inSeconds(-60))
+        let spy = Spy()
+        let refresher = refresher(stub: stub, spy: spy)
+
+        await refresher.considerRenewing(now: now)
+        await refresher.considerRenewing(now: inSeconds(600))
+        await refresher.considerRenewing(now: inSeconds(1200))
+        await refresher.considerRenewing(now: inSeconds(1800))
+        XCTAssertEqual(spy.launches, 3)
+
+        stub.value = inSeconds(-30)
+        await refresher.considerRenewing(now: inSeconds(1800))
+        XCTAssertEqual(spy.launches, 4)
     }
 
     /// A second tick must not overlap the first: `isRunning` is claimed before

@@ -49,6 +49,15 @@ enum CodexCredentials {
         )
     }
 
+    static func usageAccountID(from url: URL = authURL) -> String? {
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = root["tokens"] as? [String: Any],
+              let account = tokens["account_id"] as? String, !account.isEmpty,
+              let token = tokens["access_token"] as? String, !token.isEmpty else { return nil }
+        return UsageAccountIdentity.fingerprint("codex:\(account)")
+    }
+
     /// Claims supply identity labels and a local expiry hint. The server validates the token.
     static func claims(inJWT token: String) -> [String: Any]? {
         let parts = token.split(separator: ".")

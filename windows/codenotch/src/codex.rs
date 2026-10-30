@@ -36,7 +36,7 @@ const POLL_SECS: u64 = 300; // Codex has no session state to key off, so a fixed
 const TAIL_BYTES: u64 = 256 * 1024;
 const CURRENT_FOR_MS: u64 = 5 * 60 * 1000;
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
-const BACKOFF_MIN_SECS: u64 = 60; // wait at least this long after a 429; Retry-After only raises it
+const BACKOFF_MIN_SECS: u64 = 60; // fallback when the server gives no Retry-After
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Retry deadline given by the server (ms epoch): neither a manual refresh nor a restart may bypass it
@@ -65,12 +65,10 @@ pub fn load_persisted() -> UsageSnapshot {
     std::fs::read_to_string(store_path())
         .ok()
         .and_then(|t| serde_json::from_str::<UsageSnapshot>(&t).ok())
-        .map(|mut s| {
-            if !s.windows.is_empty() {
-                s.status = "stale".into();
-            }
+        .map(|s| {
             BACKOFF_UNTIL.store(s.backoff_until, std::sync::atomic::Ordering::Relaxed);
-            s
+            // An on-disk percentage has no account binding. Do not show a previous account at startup.
+            UsageSnapshot { backoff_until: s.backoff_until, ..Default::default() }
         })
         .unwrap_or_default()
 }
@@ -172,7 +170,7 @@ fn load_credential() -> Option<Credential> {
 
 enum LiveErr {
     NeedsAuth,
-    /// Suggested wait in seconds (BACKOFF_MIN_SECS already applied)
+    /// Suggested wait in seconds (server hint, or local fallback)
     RateLimited(u64),
     Other(String),
 }
@@ -188,21 +186,14 @@ fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
         .call();
     match resp {
         Ok(r) => r.into_json().map_err(|e| LiveErr::Other(format!("parse: {e}"))),
-        Err(ureq::Error::Status(code @ (401 | 403), r)) => {
-            // 401 is about the token; 403 can also be an edge node rejecting the user agent — record the status and the start of the body rather than folding both into "please sign in"
-            let head: String = r
-                .into_string()
-                .unwrap_or_default()
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(160)
-                .collect();
-            crate::applog(&format!("codex: usage endpoint HTTP {code}: {head}"));
+        Err(ureq::Error::Status(code @ (401 | 403), _)) => {
+            // Response bodies can contain account details. Keep diagnostics to the status code.
+            crate::applog(&format!("codex: usage endpoint HTTP {code}"));
             Err(LiveErr::NeedsAuth)
         }
         Err(ureq::Error::Status(429, r)) => {
-            let ra = r.header("retry-after").and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
-            Err(LiveErr::RateLimited(ra.max(BACKOFF_MIN_SECS)))
+            let ra = crate::polling::retry_after_secs(r.header("retry-after"), now_ms(), BACKOFF_MIN_SECS);
+            Err(LiveErr::RateLimited(ra))
         }
         Err(ureq::Error::Status(code, _)) => Err(LiveErr::Other(format!("HTTP {code}"))),
         Err(e) => Err(LiveErr::Other(format!("{e}"))),
@@ -459,6 +450,28 @@ pub fn snapshot_from_rollout(text: &str) -> Option<(Vec<LimitWindow>, Option<u64
 
 // ---------------- Putting it together ----------------
 
+fn account_bound_previous(previous: &UsageSnapshot, last: Option<&str>, current: Option<&str>) -> UsageSnapshot {
+    if current.is_some() && current == last { previous.clone() } else { UsageSnapshot::default() }
+}
+
+fn newer_rollout(
+    rollout: Option<(Vec<LimitWindow>, Option<u64>, Option<String>)>,
+    previous: &UsageSnapshot,
+    allowed: bool,
+) -> Option<(Vec<LimitWindow>, Option<u64>, Option<String>)> {
+    rollout.filter(|(_, recorded, _)| allowed && recorded.is_some_and(|at| at > previous.fetched_at))
+}
+
+fn stale_last_good(previous: &UsageSnapshot, note: Option<String>, backoff_until: u64) -> UsageSnapshot {
+    UsageSnapshot {
+        status: "stale".into(),
+        windows: previous.windows.clone(),
+        fetched_at: previous.fetched_at,
+        note: note.unwrap_or_else(|| "Last Codex reading kept".into()),
+        backoff_until,
+    }
+}
+
 /// Is Codex present on this machine (CLI installed, signed in, or has had sessions)? If not, no cell is shown
 pub fn present() -> bool {
     find_executable().is_some()
@@ -466,7 +479,7 @@ pub fn present() -> bool {
         || codex_home().map(|h| h.join("sessions").is_dir()).unwrap_or(false)
 }
 
-fn read_once() -> UsageSnapshot {
+fn read_once(previous: &UsageSnapshot, credential: Option<Credential>, allow_rollout: bool) -> (UsageSnapshot, bool) {
     let mut snap = UsageSnapshot::default();
     // Note attached to the fallback reading when the live read failed; needs_auth picks the empty state when there is no fallback either
     let mut live_note: Option<String> = None;
@@ -475,12 +488,14 @@ fn read_once() -> UsageSnapshot {
     let now = now_ms();
     if held_until > now {
         snap.backoff_until = held_until;
-        live_note = Some(format!("Rate limited — retrying in {}s", (held_until - now) / 1000));
+        live_note = Some(format!("Rate limited — retrying in {}s", crate::polling::remaining_secs(held_until, now)));
     } else {
-        match load_credential() {
+        match credential {
             None => {
+                needs_auth = true;
+                live_note = Some("Codex sign-in unavailable — previous account reading cleared".into());
                 if auth_path().map(|p| p.is_file()).unwrap_or(false) {
-                    crate::applog("codex: auth.json has no usable access_token/account_id, falling back to the rollout");
+                    crate::applog("codex: auth.json has no usable sign-in");
                 }
             }
             Some(cred) => match fetch_usage(&cred) {
@@ -492,7 +507,7 @@ fn read_once() -> UsageSnapshot {
                         snap.windows = windows;
                         snap.fetched_at = now_ms();
                         snap.note = plan.map(|p| format!("{} · via Codex", cap(&p))).unwrap_or_default();
-                        return snap;
+                        return (snap, true);
                     }
                     let keys: Vec<String> = v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
                     crate::applog(&format!("codex: usage reply has no windows (top-level keys {keys:?}), falling back to the rollout"));
@@ -507,7 +522,7 @@ fn read_once() -> UsageSnapshot {
                     });
                 }
                 Err(LiveErr::RateLimited(secs)) => {
-                    let until = now_ms() + secs * 1000;
+                    let until = crate::polling::deadline_ms(now_ms(), secs);
                     BACKOFF_UNTIL.store(until, std::sync::atomic::Ordering::Relaxed);
                     snap.backoff_until = until;
                     live_note = Some(format!("Rate limited — retrying in {secs}s"));
@@ -520,8 +535,12 @@ fn read_once() -> UsageSnapshot {
             },
         }
     }
-    // Fallback: rollout
-    match newest_rollout().and_then(|p| tail_text(&p)).and_then(|t| snapshot_from_rollout(&t)) {
+    // A rollout is useful only if newer than the last account-bound live reading.
+    // After a sign-in change we cannot prove that an older rollout belongs to this account.
+    let rollout = if allow_rollout {
+        newer_rollout(newest_rollout().and_then(|p| tail_text(&p)).and_then(|t| snapshot_from_rollout(&t)), previous, true)
+    } else { None };
+    match rollout {
         Some((windows, recorded, plan)) => {
             let rec = recorded.unwrap_or(0);
             let fresh = rec > 0 && now_ms().saturating_sub(rec) <= CURRENT_FOR_MS;
@@ -537,6 +556,9 @@ fn read_once() -> UsageSnapshot {
             }
         }
         None => {
+            if !previous.windows.is_empty() {
+                return (stale_last_good(previous, live_note, snap.backoff_until), false);
+            }
             snap.status = if needs_auth {
                 "needsAuth"
             } else if present() {
@@ -552,7 +574,7 @@ fn read_once() -> UsageSnapshot {
             };
         }
     }
-    snap
+    (snap, false)
 }
 
 fn cap(s: &str) -> String {
@@ -592,11 +614,24 @@ pub fn start(app: AppHandle) {
                 }
             }
         }
+        let mut last_identity: Option<String> = None;
+        let mut has_live_for_identity = false;
         loop {
-            let snap = read_once();
-            let hold = snap.backoff_until.saturating_sub(now_ms()) / 1000;
+            let credential = load_credential();
+            let identity = credential.as_ref().map(|c| c.account_id.clone());
+            let same_identity = identity.is_some() && identity == last_identity;
+            let current = app.state::<AppState>().codex.lock().unwrap().clone();
+            let previous = account_bound_previous(&current, last_identity.as_deref(), identity.as_deref());
+            if !same_identity {
+                BACKOFF_UNTIL.store(0, std::sync::atomic::Ordering::Relaxed);
+                has_live_for_identity = false;
+            }
+            last_identity = identity;
+            let (snap, live_success) = read_once(&previous, credential, same_identity && has_live_for_identity);
+            has_live_for_identity |= live_success;
+            let deadline = snap.backoff_until;
             broadcast(&app, snap);
-            for _ in 0..POLL_SECS.max(hold) {
+            for _ in 0..crate::polling::poll_wait_secs(POLL_SECS, deadline, now_ms()) {
                 if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
@@ -637,6 +672,35 @@ pub fn probe() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_bound_last_good_is_retained_only_for_the_same_identity() {
+        let previous = UsageSnapshot {
+            status: "ok".into(), fetched_at: 1_000,
+            windows: vec![LimitWindow { id: "primary".into(), used: 0.4, ..Default::default() }],
+            ..Default::default()
+        };
+        let same = account_bound_previous(&previous, Some("account-a"), Some("account-a"));
+        assert_eq!(same.windows[0].used, 0.4);
+        assert_eq!(same.fetched_at, 1_000);
+        assert!(account_bound_previous(&previous, Some("account-a"), Some("account-b")).windows.is_empty());
+        assert!(account_bound_previous(&previous, Some("account-a"), None).windows.is_empty());
+        assert!(account_bound_previous(&previous, None, Some("account-a")).windows.is_empty());
+        let failed = stale_last_good(&same, Some("Live read failed".into()), 2_000);
+        assert_eq!(failed.status, "stale");
+        assert_eq!(failed.windows[0].used, 0.4);
+        assert_eq!(failed.fetched_at, 1_000);
+        assert_eq!(failed.backoff_until, 2_000);
+    }
+
+    #[test]
+    fn only_newer_rollout_may_replace_account_bound_last_good() {
+        let previous = UsageSnapshot { fetched_at: 1_000, ..Default::default() };
+        let window = LimitWindow { id: "primary".into(), used: 0.8, ..Default::default() };
+        assert!(newer_rollout(Some((vec![window.clone()], Some(999), None)), &previous, true).is_none());
+        assert!(newer_rollout(Some((vec![window.clone()], Some(1_001), None)), &previous, false).is_none());
+        assert_eq!(newer_rollout(Some((vec![window], Some(1_001), None)), &previous, true).unwrap().0[0].used, 0.8);
+    }
 
     fn windows(json: &str) -> Vec<LimitWindow> {
         windows_from_usage(&serde_json::from_str(json).unwrap())

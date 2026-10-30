@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import Foundation
 
 /// Watches one profile's `sessions` directory — `~/.claude/sessions` by
@@ -41,6 +42,14 @@ final class ClaudeSessionMonitor: ObservableObject, AgentActivityMonitor {
     private var livenessTimer: Timer?
     private var debounce: DispatchWorkItem?
     private var wakeObserver: NSObjectProtocol?
+    var isWatchingCurrentDirectory: Bool {
+        guard source != nil else { return false }
+        var watched = Darwin.stat()
+        var current = Darwin.stat()
+        return fstat(descriptor, &watched) == 0 &&
+            directory.path.withCString { fstatat(AT_FDCWD, $0, &current, 0) == 0 } &&
+            watched.st_dev == current.st_dev && watched.st_ino == current.st_ino
+    }
 
     /// `livenessInterval` doubles as how often a running session's transcript
     /// is looked at, so it matches the Codex monitor's two seconds rather than
@@ -64,10 +73,22 @@ final class ClaudeSessionMonitor: ObservableObject, AgentActivityMonitor {
         // (`AntigravityActivityMonitor` does the same.)
         stop()
         rescan()
-        watchDirectory()
+        refreshDirectoryWatcher()
+
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshDirectoryWatcher()
+                self?.rescan()
+            }
+        }
 
         let timer = Timer(timeInterval: livenessInterval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.rescan() }
+            MainActor.assumeIsolated {
+                self?.refreshDirectoryWatcher()
+                self?.rescan()
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         livenessTimer = timer
@@ -77,24 +98,47 @@ final class ClaudeSessionMonitor: ObservableObject, AgentActivityMonitor {
         livenessTimer?.invalidate()
         livenessTimer = nil
         debounce?.cancel()
+        debounce = nil
         source?.cancel()
         source = nil
+        descriptor = -1
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+            self.wakeObserver = nil
+        }
+    }
+
+    /// Reopen a missing or replaced directory. The timer and wake notification
+    /// both call this, so a directory that appears later gains an event source.
+    func refreshDirectoryWatcher() {
+        if source != nil {
+            if isWatchingCurrentDirectory { return }
+            source?.cancel()
+            source = nil
+            descriptor = -1
+        }
+        watchDirectory()
     }
 
     private func watchDirectory() {
-        descriptor = open(directory.path, O_EVTONLY)
-        guard descriptor >= 0 else { return }   // no directory yet; the timer still covers us
+        let fd = open(directory.path, O_EVTONLY)
+        guard fd >= 0 else { return }   // no directory yet; the timer still covers us
+        descriptor = fd
 
         let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: descriptor,
+            fileDescriptor: fd,
             eventMask: [.write, .extend, .attrib, .delete, .rename, .revoke],
             queue: .main
         )
         source.setEventHandler { [weak self] in
-            MainActor.assumeIsolated { self?.scheduleRescan() }
+            MainActor.assumeIsolated {
+                guard let self, self.descriptor == fd else { return }
+                self.refreshDirectoryWatcher()
+                self.scheduleRescan()
+            }
         }
-        source.setCancelHandler { [descriptor] in
-            if descriptor >= 0 { close(descriptor) }
+        source.setCancelHandler {
+            close(fd)
         }
         source.resume()
         self.source = source

@@ -533,10 +533,7 @@ private struct ProviderTooltip: View {
     /// Only worth saying when the numbers are not current. A remembered reading
     /// has to be dated, or it quietly passes itself off as live.
     private var readingAge: String? {
-        guard snapshot.hasReading, let since = snapshot.status.staleSince,
-              since != .distantPast
-        else { return nil }
-        return ElapsedCopy.ago(since: since, now: now)
+        snapshot.readingNote(at: now)
     }
 
     private struct WindowGroup: Identifiable {
@@ -563,7 +560,7 @@ private struct ProviderTooltip: View {
                           ? L10n.t("\(snapshot.localModel?.brand?.displayName ?? snapshot.displayName) · Local")
                           : L10n.t("\(snapshot.displayName) Usage"),
                           subtitle: snapshot.plan,
-                          note: activityNote ?? (snapshot.localModel?.brand != nil ? snapshot.displayName : readingAge)) {
+                          note: readingAge ?? activityNote ?? (snapshot.localModel?.brand != nil ? snapshot.displayName : nil)) {
                 ProviderGlyphView(glyph: snapshot.glyph)
                     .foregroundStyle(Palette.textPrimary)
             }

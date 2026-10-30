@@ -32,6 +32,28 @@ enum ReleaseNotes {
     static var all: [ReleaseNote] {
         [
             ReleaseNote(
+                version: "1.17.4",
+                headline: L10n.t("Usage percentages keep the time they were measured, and a dropped connection keeps the last reading."),
+                changes: [
+                    ReleaseNote.Change(
+                        title: L10n.t("A percentage keeps the time it was measured"),
+                        detail: L10n.t("Reading a cached result again no longer makes an old Claude or provider number look brand new.")
+                    ),
+                    ReleaseNote.Change(
+                        title: L10n.t("One late refresh no longer stops the next"),
+                        detail: L10n.t("A refresh that finishes late can no longer cancel the one that started after it. A provider that does not answer is marked timed out while the others keep updating.")
+                    ),
+                    ReleaseNote.Change(
+                        title: L10n.t("A brief failure keeps the last percentage"),
+                        detail: L10n.t("On Mac and Windows, a temporary error keeps the last reading for the same account and says why it is waiting. Switching accounts or signing out removes the old number.")
+                    ),
+                    ReleaseNote.Change(
+                        title: L10n.t("Sign-in renewal retries after a hiccup"),
+                        detail: L10n.t("Claude and Grok no longer treat one failed renewal as permanent for that expiry. They try a few times, then wait for a real sign-in change.")
+                    ),
+                ]
+            ),
+            ReleaseNote(
                 version: "1.17.3",
                 headline: L10n.t("Grok renews its own sign-in, and the Windows hover card stays on screen."),
                 changes: [

@@ -28,6 +28,11 @@ actor ClaudeOAuthProvider: UsageProvider {
     nonisolated let id: String
     nonisolated let displayName: String
     nonisolated let glyph = ProviderGlyph.claude
+    nonisolated var canRefreshDuringBackoff: Bool { true }
+    nonisolated var usageAccountID: String? {
+        guard let organization = profile.organizationID() else { return nil }
+        return UsageAccountIdentity.fingerprint("claude:\(organization):\(profile.signedInAddress() ?? "")")
+    }
     /// This profile's token, behind its own cache — see `ClaudeKeychain`.
     nonisolated private let keychain: ClaudeKeychain
 
@@ -69,12 +74,10 @@ actor ClaudeOAuthProvider: UsageProvider {
     nonisolated private let desktopCache: ClaudeDesktopUsageCache?
     /// How recent a Desktop snapshot has to be to stand in for a live reading.
     ///
-    /// Thirty minutes, from watching a real cache: while Claude Desktop is open it
-    /// rewrites this entry every five to fifteen minutes, with the occasional
-    /// half-hour gap when it is left in the background. So thirty minutes rides
-    /// out an ordinary gap without ever presenting a number that could be far
-    /// wrong — the session window moved eleven points in fifteen minutes on the
-    /// day this was measured, which is why it is not an hour.
+    /// Only a recent Desktop response may replace a live lookup. Desktop can
+    /// refresh much less often than the monitor, so its availability alone is
+    /// not evidence that its numbers are current. An older reading falls through
+    /// to the CLI or remote source instead of blocking newer measurements.
     ///
     /// Past it the source simply drops through, and `UsageStore` does the rest: it
     /// re-shows the last good reading, undimmed for its own fifteen minutes and
@@ -100,15 +103,16 @@ actor ClaudeOAuthProvider: UsageProvider {
     /// Stamped on every spawn, successful or not. Without it a Claude Code that
     /// is installed but signed out costs a process on every tick, forever.
     private var lastCLIAttempt: Date?
+    private var lastCLIFailure: Date?
 
     init(profile: ClaudeProfile = .default(),
          session: URLSession = .shared,
          archive: UsageArchive = UsageArchive(),
          loadCredentials: (@Sendable () throws -> ClaudeCredentials)? = nil,
          cli: ClaudeUsageCLI? = ClaudeUsageCLI.locate(),
-         cliRefreshInterval: TimeInterval = 5 * 60,
+         cliRefreshInterval: TimeInterval = 60,
          desktopCache: ClaudeDesktopUsageCache? = ClaudeDesktopUsageCache(),
-         desktopFreshness: TimeInterval = 30 * 60,
+         desktopFreshness: TimeInterval = 60,
          desktopRescanInterval: TimeInterval = 5 * 60) {
         self.cli = cli
         self.cliRefreshInterval = cliRefreshInterval
@@ -128,23 +132,10 @@ actor ClaudeOAuthProvider: UsageProvider {
         self.retryNoEarlierThan = archive.loadBackoffUntil(providerID: profile.id)
     }
 
-    /// How close to expiry a back-off counts as already expired.
-    ///
-    /// The server hands back a 60s hint and `UsageStore` also ticks every 60s,
-    /// so the two run at the same period and the tick lands a few milliseconds
-    /// *before* the window opens — `retryAfter: 0.015` in the log. Refusing
-    /// that costs far more than the 15ms it saves: the caller is a timer, not a
-    /// retry loop, so the next attempt is not a moment later but a whole
-    /// refresh interval later. A 60s penalty silently becomes 120s and every
-    /// other tick is spent on nothing.
-    private let backoffSlack: TimeInterval = 1
-
-    /// Pure, so the resonance this exists to break can be tested without a
-    /// timer and a live endpoint.
-    nonisolated static func shouldHoldOff(until: Date?, slack: TimeInterval,
-                                          now: Date = Date()) -> Bool {
+    /// The store now wakes at the deadline; no early-request slack is needed.
+    nonisolated static func shouldHoldOff(until: Date?, now: Date = Date()) -> Bool {
         guard let until else { return false }
-        return until.timeIntervalSince(now) > slack
+        return until > now
     }
 
     func fetchSnapshot() async throws -> ProviderSnapshot {
@@ -165,21 +156,23 @@ actor ClaudeOAuthProvider: UsageProvider {
         // Ahead of both the CLI and the back-off check. This is the cheapest
         // source and the only one that can never interrupt anyone: it reads a
         // file Claude Desktop has already written.
-        if let windows = await desktopWindows() {
-            return snapshot(windows: windows)
+        if let reading = await desktopWindows() {
+            return snapshot(windows: reading.windows,
+                            observation: UsageObservation(measuredAt: reading.measuredAt, source: .desktopCache))
         }
         // Ahead of the back-off check on purpose. That deadline is the
         // endpoint's, and the CLI does not share the endpoint's rate limit —
         // there is no reason for a 429 on one to darken a ring the other can
         // still fill.
-        if let windows = await cliWindows() {
-            return snapshot(windows: windows, plan: lastCLIPlan)
+        if let reading = await cliWindows() {
+            return snapshot(windows: reading.windows, plan: lastCLIPlan,
+                            observation: UsageObservation(measuredAt: reading.measuredAt, source: .cli))
         }
         return try await fetchFromKeychain()
     }
 
     private func fetchFromKeychain() async throws -> ProviderSnapshot {
-        if Self.shouldHoldOff(until: retryNoEarlierThan, slack: backoffSlack),
+        if Self.shouldHoldOff(until: retryNoEarlierThan),
            let retryNoEarlierThan {
             let remaining = retryNoEarlierThan.timeIntervalSinceNow
             Log.usage.debug("skipping fetch, backing off for \(remaining, format: .fixed(precision: 0))s")
@@ -218,7 +211,8 @@ actor ClaudeOAuthProvider: UsageProvider {
     /// The snapshot shape every source produces. One place, so a window order or
     /// a headline changed for the endpoint cannot quietly differ from the CLI's or
     /// Desktop's — the three are the same reading taken from three places.
-    private func snapshot(windows: [LimitWindow], plan: String? = nil) -> ProviderSnapshot {
+    private func snapshot(windows: [LimitWindow], plan: String? = nil,
+                          observation: UsageObservation) -> ProviderSnapshot {
         ProviderSnapshot(
             id: id,
             displayName: displayName,
@@ -230,7 +224,8 @@ actor ClaudeOAuthProvider: UsageProvider {
             // #102's second ring. The helper is the only place a Claude
             // snapshot is built now, so this is the only place it can go.
             weeklyID: "weekly_all",
-            plan: plan?.nonEmptyPlan
+            plan: plan?.nonEmptyPlan,
+            observation: observation
         )
     }
 
@@ -247,7 +242,7 @@ actor ClaudeOAuthProvider: UsageProvider {
     /// good reading to `UsageStore`, which already re-shows it with the age it
     /// actually has and dims it — where returning it here would present numbers
     /// from an hour ago as a live `.ok`.
-    private func desktopWindows() async -> [LimitWindow]? {
+    private func desktopWindows() async -> (windows: [LimitWindow], measuredAt: Date)? {
         guard let desktopCache else { return nil }
         let now = Date()
         // A recent miss means the next read would be a full scan for something
@@ -291,7 +286,7 @@ actor ClaudeOAuthProvider: UsageProvider {
         }
         lastDesktopMiss = nil
         Log.usage.debug("\(self.id, privacy: .public): read \(reading.windows.count) windows from the claude desktop cache entry \(reading.entry.lastPathComponent, privacy: .public)")
-        return reading.windows
+        return (reading.windows, reading.capturedAt)
     }
 
     /// Whether any window in a reading names a reset time that has already
@@ -311,7 +306,7 @@ actor ClaudeOAuthProvider: UsageProvider {
     /// endpoint instead, not a reason to fail the refresh. The endpoint's
     /// errors are also the ones `UsageStore` knows how to word, and a status
     /// invented here would be a second vocabulary saying the same things.
-    private func cliWindows() async -> [LimitWindow]? {
+    private func cliWindows() async -> (windows: [LimitWindow], measuredAt: Date)? {
         guard let cli else { return nil }
         let now = Date()
 
@@ -326,8 +321,11 @@ actor ClaudeOAuthProvider: UsageProvider {
         if let last = lastCLIWindows,
            now.timeIntervalSince(last.at) < cliRefreshInterval,
            !Self.hasExpiredWindow(last.windows, at: now) {
-            return last.windows
+            return (last.windows, last.at)
         }
+        // A working CLI is sampled at the live cadence. A broken or unsupported
+        // /usage command gets a longer cooldown while the remote source is used.
+        if let lastCLIFailure, now.timeIntervalSince(lastCLIFailure) < 5 * 60 { return nil }
         if let lastCLIAttempt, now.timeIntervalSince(lastCLIAttempt) < cliRefreshInterval {
             return nil
         }
@@ -335,11 +333,14 @@ actor ClaudeOAuthProvider: UsageProvider {
 
         do {
             let reading = try await cli.readWithPlan(profile: profile, now: now)
-            lastCLIWindows = (reading.windows, now)
+            let measuredAt = Date()
+            lastCLIWindows = (reading.windows, measuredAt)
+            lastCLIFailure = nil
             lastCLIPlan = reading.plan
             Log.usage.debug("\(self.id, privacy: .public): read \(reading.windows.count) windows from claude /usage")
-            return reading.windows
+            return (reading.windows, measuredAt)
         } catch {
+            lastCLIFailure = Date()
             Log.usage.debug("\(self.id, privacy: .public): claude /usage did not answer, falling back to the token")
             return nil
         }
@@ -393,7 +394,8 @@ actor ClaudeOAuthProvider: UsageProvider {
                 L10n.t("Claude answered, but listed no usage limits for this account. Some Enterprise and team plans don't report them.")
             )
         }
-        return snapshot(windows: windows, plan: credentials?.subscriptionType)
+        return snapshot(windows: windows, plan: credentials?.subscriptionType,
+                        observation: UsageObservation(measuredAt: Date(), source: .remote))
     }
 
     private func currentToken() throws -> String {
@@ -427,27 +429,12 @@ actor ClaudeOAuthProvider: UsageProvider {
     /// which is what keeps you rate limited. So the wait starts at a minute and
     /// doubles for each 429 in a row, capped so it always recovers on its own.
     static func backoff(forAttempt attempt: Int, retryAfter: TimeInterval?) -> TimeInterval {
-        let floor: TimeInterval = 60
-        let ceiling: TimeInterval = 15 * 60
-        let doubled = floor * pow(2, Double(min(attempt, 4)))
-        return min(ceiling, max(doubled, retryAfter ?? 0))
+        UsageRetryPolicy.backoff(attempt: attempt, retryAfter: retryAfter)
     }
 
     /// `Retry-After` is either a number of seconds or an HTTP date.
     static func retryAfter(from response: URLResponse?) -> TimeInterval? {
-        guard let header = (response as? HTTPURLResponse)?
-            .value(forHTTPHeaderField: "Retry-After")?
-            .trimmingCharacters(in: .whitespaces)
-        else { return nil }
-
-        if let seconds = TimeInterval(header) { return max(0, seconds) }
-
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "GMT")
-        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        guard let date = formatter.date(from: header) else { return nil }
-        return max(0, date.timeIntervalSinceNow)
+        UsageRetryPolicy.retryAfter(from: response)
     }
 
     nonisolated var signInRoute: SignInRoute {

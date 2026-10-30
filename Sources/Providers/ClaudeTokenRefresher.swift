@@ -1,12 +1,13 @@
 import Foundation
 
-/// Keeps the Claude OAuth token in the login keychain from ageing out.
+/// Keeps a Claude profile's OAuth token from ageing out.
 ///
-/// Provider Monitor reads that item; only the standalone Claude Code command ever
-/// writes it. On a Mac where Claude Code is used through the desktop app the
-/// item is therefore written once and then rots — the desktop app renews its
-/// own copy elsewhere — and eight hours later every usage reading stops, with
-/// nothing the user can do from inside Provider Monitor. That is the hole this fills.
+/// Provider Monitor reads each profile's saved token; only the standalone
+/// Claude Code command ever writes it. On a Mac where Claude Code is used
+/// through the desktop app the item is therefore written once and then rots —
+/// the desktop app renews its own copy elsewhere — and eight hours later every
+/// usage reading stops, with nothing the user can do from inside Provider
+/// Monitor. That is the hole this fills.
 ///
 /// **How it renews, and why that is a compatibility mechanism rather than an
 /// interface.** Running `claude -p` with an empty stdin makes the command go
@@ -20,10 +21,10 @@ import Foundation
 /// None of that is promised by anyone. A future release could stop renewing at
 /// start-up, or stop rejecting an empty prompt. Both are handled by judging the
 /// *outcome* instead of trusting the command: unless the expiry actually moved,
-/// this reports failure and stops trying. And because it never supplies a
-/// prompt, a version that started accepting empty input could not be talked
-/// into answering one by accident — the failure mode is a wasted launch, never
-/// an invented conversation.
+/// this reports failure and retries at most twice after the cooldown. Because
+/// it never supplies a prompt, a version that started accepting empty input
+/// could not be talked into answering one by accident — the failure mode is a
+/// wasted launch, never an invented conversation.
 @MainActor
 final class ClaudeTokenRefresher: ObservableObject {
     enum Outcome: Equatable {
@@ -51,7 +52,7 @@ final class ClaudeTokenRefresher: ObservableObject {
     /// **Must stay under Claude Code's own five minutes.** Its start-up renews
     /// the token only when `Date.now() + 300s >= expiresAt`; launching it any
     /// earlier than that is a no-op, which this would then correctly report as
-    /// a failure and stop retrying. Four minutes leaves room for a slow start
+    /// a failure and spend an attempt. Four minutes leaves room for a slow start
     /// without crossing that line.
     private let margin: TimeInterval
     private let cooldown: TimeInterval
@@ -72,21 +73,19 @@ final class ClaudeTokenRefresher: ObservableObject {
     /// first `await` — not after, which is what would leave a window for two
     /// overlapping calls to both pass the guard.
     var isRunningForTesting: Bool { isRunning }
-    private var lastAttempt: Date?
-    /// The expiry a launch was already spent on. One attempt per token, which
-    /// is what makes a failure stop instead of looping: a token that did not
-    /// renew has the same expiry next tick, and is refused.
-    private var attemptedFor: Date?
+    var timerForTesting: Timer? { timer }
+    private var renewalPolicy = TokenRenewalPolicy()
 
     init(
         expiry: @escaping @MainActor () async -> Date?,
         reload: @escaping @MainActor () async -> Date?,
         cli: URL? = ClaudeCLI.standalone(),
+        profile: ClaudeProfile = .default(),
         margin: TimeInterval = 4 * 60,
         cooldown: TimeInterval = 10 * 60,
         timeout: TimeInterval = 30,
         interval: TimeInterval = 60,
-        launcher: @escaping Launcher = ClaudeTokenRefresher.run
+        launcher: Launcher? = nil
     ) {
         self.expiry = expiry
         self.reload = reload
@@ -95,10 +94,15 @@ final class ClaudeTokenRefresher: ObservableObject {
         self.cooldown = cooldown
         self.timeout = timeout
         self.interval = interval
-        self.launcher = launcher
+        // Keep the two-argument injected launcher unchanged. Only the real
+        // process launcher needs the profile's configuration directory.
+        self.launcher = launcher ?? { cli, timeout in
+            try ClaudeTokenRefresher.run(cli, timeout: timeout, profile: profile)
+        }
     }
 
     func start() {
+        guard timer == nil else { return }
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -117,36 +121,11 @@ final class ClaudeTokenRefresher: ObservableObject {
 
     // MARK: - The gate
 
-    /// Whether a launch is worth making. Pure, so every branch is testable
-    /// without a clock, a keychain or a subprocess.
-    static func shouldRenew(
-        expiry: Date?,
-        now: Date,
-        margin: TimeInterval,
-        attemptedFor: Date?,
-        lastAttempt: Date?,
-        cooldown: TimeInterval
-    ) -> Bool {
-        // Nothing read yet: never launch on a guess.
-        guard let expiry else { return false }
-        // Plenty of time left. Also the case where launching would do nothing,
-        // because the command's own gate has not opened either.
-        guard expiry.timeIntervalSince(now) < margin else { return false }
-        // Already spent an attempt on this exact token. This is the whole
-        // no-retry-loop guarantee: a launch that failed to move the expiry
-        // leaves the same value here next tick, and never runs again.
-        guard expiry != attemptedFor else { return false }
-        if let lastAttempt, now.timeIntervalSince(lastAttempt) < cooldown { return false }
-        return true
-    }
-
     func considerRenewing(now: Date = Date()) async {
         // Claimed here, synchronously, before anything is awaited — not after
-        // deciding there is something to do. `shouldRenew` also happens to
-        // block a second overlapping call in the common case (it shares
-        // `attemptedFor` and the cooldown, both written moments from now), but
-        // both of those depend on the two calls agreeing on roughly the same
-        // token and the same `now`. `isRunning` does not: it is what makes "at
+        // deciding there is something to do. The policy also blocks most
+        // overlapping calls, but it depends on both calls seeing the same
+        // token and clock. `isRunning` is what makes "at
         // most one launch" true unconditionally, and it can only do that by
         // being set before the first `await` — set any later and a second
         // overlapping call reaches this same guard while `isRunning` is still
@@ -156,21 +135,21 @@ final class ClaudeTokenRefresher: ObservableObject {
         defer { isRunning = false; launchedPID = nil }
 
         let current = await expiry()
-        guard Self.shouldRenew(expiry: current, now: now, margin: margin,
-                               attemptedFor: attemptedFor, lastAttempt: lastAttempt,
-                               cooldown: cooldown),
+        guard renewalPolicy.shouldAttempt(expiry: current, now: now, margin: margin,
+                                          cooldown: cooldown),
               let current
         else { return }
 
-        lastAttempt = now
-        attemptedFor = current
-
         let remaining = current.timeIntervalSince(now)
         guard let cli else {
+            // This instance cannot acquire a CLI later; repeating the warning
+            // on every tick would achieve nothing.
+            renewalPolicy.finishForCurrentExpiry()
             fail("Claude's saved login is about to expire and the `claude` command "
                + "isn't installed to renew it. Run Claude Code once to sign in again.")
             return
         }
+        renewalPolicy.recordAttempt(at: now)
         Log.usage.notice("claude token expires in \(remaining, format: .fixed(precision: 0))s; renewing via \(cli.path, privacy: .public)")
 
         let status: Int32?
@@ -192,6 +171,7 @@ final class ClaudeTokenRefresher: ObservableObject {
             Log.usage.error("token renewal ran (exit \(status ?? -1)) but the expiry did not move; still \(String(describing: after), privacy: .public)")
             return
         }
+        renewalPolicy.finishForCurrentExpiry()
         outcome = .refreshed(until: after)
         Log.usage.notice("claude token renewed, now expires \(after, privacy: .public)")
     }
@@ -215,18 +195,29 @@ final class ClaudeTokenRefresher: ObservableObject {
     /// volumes to the user as Codenotch asking for access.
     static let arguments = ["-p", "--no-session-persistence", "--strict-mcp-config"]
 
-    static func run(_ cli: URL, timeout: TimeInterval) throws
+    static func run(_ cli: URL, timeout: TimeInterval,
+                    profile: ClaudeProfile = .default(),
+                    inheritedEnvironment: [String: String] = ProcessInfo.processInfo.environment) throws
         -> (pid: Int32, exit: () async -> Int32?) {
         let process = Process()
         process.executableURL = cli
         process.arguments = Self.arguments
+        var environment = inheritedEnvironment
+        // Explicitly clear an inherited override for the default profile.
+        // Setting ~/.claude is different from leaving it unset: Claude Code
+        // then looks for .claude.json inside the config directory rather than
+        // beside it. A named profile must receive its exact directory.
+        if profile.slug == nil {
+            environment.removeValue(forKey: "CLAUDE_CONFIG_DIR")
+        } else {
+            environment["CLAUDE_CONFIG_DIR"] = profile.configDirectory.path
+        }
         // The same fixed directory `/usage` runs from, never the app's own.
         if let scratch = try? ClaudeUsageCLI.scratchDirectory() {
             process.currentDirectoryURL = scratch
-            var environment = ProcessInfo.processInfo.environment
             environment["PWD"] = scratch.path
-            process.environment = environment
         }
+        process.environment = environment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice

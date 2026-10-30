@@ -39,6 +39,18 @@ final class ClaudeTranscriptTests: XCTestCase {
                        .finished)
     }
 
+    func testIncompleteOrUnknownAssistantStopReasonDoesNotProveIdle() {
+        XCTAssertNil(turn(
+            #"{"type":"assistant","message":{"stop_reason":"end_turn"}}"#,
+            #"{"type":"assistant","message":{"content":[]}}"#
+        ))
+        XCTAssertNil(turn(#"{"type":"assistant","message":{"stop_reason":"new_reason"}}"#))
+        XCTAssertNil(turn(
+            #"{"type":"assistant","message":{"stop_reason":"end_turn"}}"#,
+            #"{"type":"assistant","message":{"stop_reason":"tool_use""#
+        ))
+    }
+
     /// A tool result means the tool is done and the model is thinking about it,
     /// which is the part of a turn that looks quietest from outside.
     func testAToolResultIsStillWork() {
@@ -117,6 +129,16 @@ final class ClaudeTranscriptTests: XCTestCase {
 
 /// The reader that puts the state machine on a timer.
 final class ClaudeTranscriptReaderTests: XCTestCase {
+    private final class CountingFileManager: FileManager {
+        var projectScans = 0
+        var projectsPath = ""
+
+        override func contentsOfDirectory(atPath path: String) throws -> [String] {
+            if path == projectsPath { projectScans += 1 }
+            return try super.contentsOfDirectory(atPath: path)
+        }
+    }
+
     private var projects: URL!
 
     override func setUpWithError() throws {
@@ -158,6 +180,81 @@ final class ClaudeTranscriptReaderTests: XCTestCase {
     func testSaysNothingWhenThereIsNoTranscript() {
         let reader = ClaudeTranscriptReader(projects: projects)
         XCTAssertNil(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app"))
+    }
+
+    func testMissedTranscriptIsFoundElsewhereAfterRetryWithSameReader() throws {
+        var now = Date(timeIntervalSince1970: 1_700_000_000)
+        let files = CountingFileManager()
+        files.projectsPath = projects.path
+        let reader = ClaudeTranscriptReader(projects: projects, fileManager: files,
+                                           negativeRetryInterval: 30, clock: { now })
+
+        XCTAssertNil(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app"))
+        XCTAssertEqual(files.projectScans, 1)
+        try write(done, folder: "-Users-vinz-elsewhere", session: "abc")
+        now = now.addingTimeInterval(29)
+        XCTAssertNil(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app"))
+        XCTAssertEqual(files.projectScans, 1)
+        now = now.addingTimeInterval(1)
+        XCTAssertEqual(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app")?.turn, .finished)
+        XCTAssertEqual(files.projectScans, 2)
+    }
+
+    func testFailedFallbackScanIsBoundedButDirectSlugIsCheckedEachTick() throws {
+        var now = Date(timeIntervalSince1970: 1_700_000_000)
+        let files = CountingFileManager()
+        files.projectsPath = projects.path
+        let reader = ClaudeTranscriptReader(projects: projects, fileManager: files,
+                                           negativeRetryInterval: 30, clock: { now })
+
+        for _ in 0..<20 {
+            XCTAssertNil(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app"))
+            now = now.addingTimeInterval(1)
+        }
+        XCTAssertEqual(files.projectScans, 1)
+
+        try write(working, folder: "-Users-vinz-app", session: "abc")
+        XCTAssertEqual(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app")?.turn, .inFlight)
+        XCTAssertEqual(files.projectScans, 1)
+    }
+
+    func testKnownPathMoveFindsNewLocationImmediately() throws {
+        let original = try write(working, folder: "-Users-vinz-elsewhere", session: "abc")
+        let reader = ClaudeTranscriptReader(projects: projects)
+        XCTAssertEqual(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app")?.turn, .inFlight)
+
+        let destination = projects.appendingPathComponent("-Users-vinz-moved")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let moved = destination.appendingPathComponent("abc.jsonl")
+        try FileManager.default.moveItem(at: original, to: moved)
+        try Data(done.utf8).write(to: moved)
+
+        XCTAssertEqual(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app")?.turn, .finished)
+    }
+
+    func testDeletedKnownPathDoesNotKeepItsOldActivity() throws {
+        let original = try write(working, folder: "-Users-vinz-app", session: "abc")
+        let reader = ClaudeTranscriptReader(projects: projects)
+        XCTAssertEqual(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app")?.turn, .inFlight)
+        try FileManager.default.removeItem(at: original)
+        XCTAssertNil(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app"))
+    }
+
+    func testReplacementAtSamePathInvalidatesCachedTurn() throws {
+        let original = try write(working, folder: "-Users-vinz-app", session: "abc")
+        let frozen = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: frozen], ofItemAtPath: original.path)
+        let reader = ClaudeTranscriptReader(projects: projects)
+        XCTAssertEqual(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app")?.turn, .inFlight)
+
+        XCTAssertEqual(working.utf8.count, done.utf8.count)
+        let replacement = projects.appendingPathComponent("replacement.jsonl")
+        try Data(done.utf8).write(to: replacement)
+        try FileManager.default.setAttributes([.modificationDate: frozen],
+                                              ofItemAtPath: replacement.path)
+        try FileManager.default.removeItem(at: original)
+        try FileManager.default.moveItem(at: replacement, to: original)
+        XCTAssertEqual(reader.activity(sessionID: "abc", cwd: "/Users/vinz/app")?.turn, .finished)
     }
 
     /// `since` is when the turn last moved, which is what the tooltip counts

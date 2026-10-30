@@ -1555,6 +1555,14 @@ private struct AccountRow: View {
                 .font(.caption)
                 .padding(.leading, 48)
 
+            if isConnected, let note = provider.connectionNote {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 48)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             // Outside `detail` on purpose. That chain shows the account summary
             // whenever there is an account, and an aged-out token still has
             // one — the credential is there, it is simply too old to use. Put

@@ -1,0 +1,18 @@
+{
+  "retry_after": [
+    {"header": null, "now_ms": 1000, "fallback_secs": 60, "expected_secs": 60},
+    {"header": "2", "now_ms": 1000, "fallback_secs": 60, "expected_secs": 2},
+    {"header": "0", "now_ms": 1000, "fallback_secs": 60, "expected_secs": 60},
+    {"header": "0.25", "now_ms": 1000, "fallback_secs": 60, "expected_secs": 1},
+    {"header": "2.01", "now_ms": 1000, "fallback_secs": 60, "expected_secs": 3},
+    {"header": "Thu, 01 Jan 1970 00:00:02 +0000", "now_ms": 1001, "fallback_secs": 60, "expected_secs": 1},
+    {"header": "Thu, 01 Jan 1970 00:00:02 +0000", "now_ms": 2000, "fallback_secs": 60, "expected_secs": 60},
+    {"header": "18446744073709551616", "now_ms": 1000, "fallback_secs": 60, "expected_secs": 60},
+    {"header": "invalid", "now_ms": 1000, "fallback_secs": 60, "expected_secs": 60}
+  ],
+  "deadline": [
+    {"deadline_ms": 2001, "now_ms": 1000, "expected_secs": 2},
+    {"deadline_ms": 2001, "now_ms": 1001, "expected_secs": 1},
+    {"deadline_ms": 2001, "now_ms": 2001, "expected_secs": 0}
+  ]
+}

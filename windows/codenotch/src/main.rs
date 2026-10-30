@@ -10,6 +10,7 @@ mod server;
 mod state;
 mod tray;
 mod usage;
+mod polling;
 mod codex;
 mod cursor;
 mod antigravity;
@@ -528,11 +529,6 @@ fn get_usage(state: tauri::State<AppState>) -> usage::UsageSnapshot {
 
 #[tauri::command]
 fn refresh_usage(app: AppHandle) {
-    {
-        let st = app.state::<AppState>();
-        let mut u = st.usage.lock().unwrap();
-        u.backoff_until = 0;
-    }
     usage::request_refresh();
     codex::request_refresh();
     cursor::request_refresh();
@@ -643,12 +639,7 @@ fn get_kiro(state: tauri::State<AppState>) -> usage::UsageSnapshot {
 
 fn request_provider_refresh(app: &AppHandle, provider: &str) -> bool {
     match provider {
-        "claude" => {
-            if let Ok(mut snap) = app.state::<AppState>().usage.lock() {
-                snap.backoff_until = 0;
-            }
-            usage::request_refresh();
-        }
+        "claude" => usage::request_refresh(),
         "codex" => codex::request_refresh(),
         "cursor" => cursor::request_refresh(),
         "gemini" => antigravity::request_refresh(),

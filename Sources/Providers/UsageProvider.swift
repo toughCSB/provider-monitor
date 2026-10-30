@@ -14,6 +14,11 @@ protocol UsageProvider {
     var displayName: String { get }
     var glyph: ProviderGlyph { get }
     func fetchSnapshot() async throws -> ProviderSnapshot
+    /// A stable, opaque identity read without prompting. Nil means history cannot
+    /// safely survive an authentication failure. Never a raw token or address.
+    var usageAccountID: String? { get }
+    /// A local fallback may still answer while the remote endpoint is backing off.
+    var canRefreshDuringBackoff: Bool { get }
     /// Whose readings these are. Declared here rather than only in an extension:
     /// a method that exists solely in a protocol extension is dispatched
     /// *statically*, so calling it through `any UsageProvider` would always land
@@ -82,6 +87,8 @@ protocol UsageProvider {
 }
 
 extension UsageProvider {
+    var usageAccountID: String? { nil }
+    var canRefreshDuringBackoff: Bool { false }
     func presentAccountSwitch() { presentSignIn() }
 
     var isVisibleWhenAbsent: Bool { true }
@@ -98,6 +105,7 @@ extension UsageProvider {
 }
 
 enum UsageProviderError: Error {
+    case accountChanged
     /// No usable credential — the user has to sign in again.
     case needsAuth
     /// The credential is there, and macOS refused to hand it over — the

@@ -7,6 +7,7 @@ actor CodexLocalProvider: UsageProvider {
     nonisolated let displayName: String
     nonisolated let glyph = ProviderGlyph.openai
     nonisolated let profile: CodexProfile
+    nonisolated var usageAccountID: String? { CodexCredentials.usageAccountID(from: authURL) }
 
     private let session: URLSession
     nonisolated private let authURL: URL
@@ -155,17 +156,7 @@ actor CodexLocalProvider: UsageProvider {
     }
 
     private static func retryAfter(from response: HTTPURLResponse?, now: Date) -> TimeInterval? {
-        guard let header = response?.value(forHTTPHeaderField: "Retry-After")?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        else { return nil }
-        if let seconds = TimeInterval(header), seconds.isFinite { return max(0, seconds) }
-
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "GMT")
-        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        guard let date = formatter.date(from: header) else { return nil }
-        return max(0, date.timeIntervalSince(now))
+        UsageRetryPolicy.retryAfter(from: response, at: now)
     }
 }
 

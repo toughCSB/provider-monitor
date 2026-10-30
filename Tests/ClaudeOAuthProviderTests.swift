@@ -15,25 +15,48 @@ final class ClaudeOAuthProviderTests: XCTestCase {
 
     // MARK: - Back-off against the refresh tick
 
-    /// A window that opens in 15ms is open. Refusing it does not delay the
-    /// fetch by 15ms — the caller is a timer, so it delays it by a whole
-    /// refresh interval, and the server's 60s penalty becomes 120s.
-    func testAWindowAboutToOpenCountsAsOpen() {
+    /// The store wakes at the actual deadline, so a request must not start early.
+    func testAWindowAboutToOpenStillHonoursTheServerDeadline() {
         let now = Date()
-        XCTAssertFalse(ClaudeOAuthProvider.shouldHoldOff(
-            until: now.addingTimeInterval(0.015), slack: 1, now: now))
-        XCTAssertFalse(ClaudeOAuthProvider.shouldHoldOff(
-            until: now.addingTimeInterval(0.42), slack: 1, now: now))
+        XCTAssertTrue(ClaudeOAuthProvider.shouldHoldOff(
+            until: now.addingTimeInterval(0.015), now: now))
+        XCTAssertTrue(ClaudeOAuthProvider.shouldHoldOff(
+            until: now.addingTimeInterval(0.42), now: now))
+        XCTAssertFalse(ClaudeOAuthProvider.shouldHoldOff(until: now, now: now))
     }
 
     func testARealPenaltyIsStillHonoured() {
         let now = Date()
         XCTAssertTrue(ClaudeOAuthProvider.shouldHoldOff(
-            until: now.addingTimeInterval(45), slack: 1, now: now))
+            until: now.addingTimeInterval(45), now: now))
     }
 
     func testNoPenaltyMeansNoHoldOff() {
-        XCTAssertFalse(ClaudeOAuthProvider.shouldHoldOff(until: nil, slack: 1))
+        XCTAssertFalse(ClaudeOAuthProvider.shouldHoldOff(until: nil))
+    }
+
+    @MainActor
+    func testCachedReadingRetainsItsMeasurementTimeThroughTheStore() async throws {
+        StubEndpoint.reset([.init(status: 200, body: Self.usagePayload)])
+        let source = CredentialSource(readable: true)
+        let provider = makeProvider(source: source, profile: desktopProfile(),
+                                    desktopCache: desktopCache(age: 20 * 60))
+        let suite = "UsageMeasurementTimeTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let archive = UsageArchive(defaults: defaults)
+        let store = UsageStore(providers: [provider], archive: archive)
+
+        await store.refresh(providerID: provider.id)?.value
+        let first = try XCTUnwrap(archive.load()[provider.id])
+        await store.refresh(providerID: provider.id)?.value
+        let second = try XCTUnwrap(archive.load()[provider.id])
+
+        XCTAssertEqual(StubEndpoint.requestCount, 0)
+        XCTAssertGreaterThan(Date().timeIntervalSince(first.fetchedAt), 1190,
+                             "Reading a cache must not make its measurement new")
+        XCTAssertEqual(first.fetchedAt, second.fetchedAt,
+                       "Repeated reads must preserve the same measurement time")
     }
 
     override func tearDown() {

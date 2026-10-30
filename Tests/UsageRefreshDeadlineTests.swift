@@ -70,7 +70,52 @@ final class UsageRefreshDeadlineTests: XCTestCase {
         try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
     }
 
+    func testOldPassCannotCancelNewerPassDeadline() async {
+        let deadline: TimeInterval = 1.5
+        let old = BlockingProvider(id: "old")
+        let slow = BlockingProvider(id: "slow")
+        let store = store([old, slow], deadline: deadline)
+        store.refreshNow()
+        await settle(0.1)
+        XCTAssertEqual(old.calls, 1)
+        XCTAssertEqual(slow.calls, 1)
+        slow.release()
+        await settle(deadline + 0.2)
+        XCTAssertFalse(store.isRefreshingForTesting)
+
+        store.refreshNow()
+        await settle(0.1)
+        XCTAssertEqual(slow.calls, 2)
+        XCTAssertEqual(store.refreshing, ["slow"])
+        old.release()
+        await settle(0.1)
+        XCTAssertTrue(store.isRefreshingForTesting,
+                      "Old pass must not finish the newer pass")
+        await settle(deadline + 0.2)
+        XCTAssertFalse(store.refreshing.contains("slow"),
+                       "Newer pass deadline must clear its spinner")
+        slow.release()
+        await settle(0.1)
+    }
+
     // MARK: - Success
+
+    func testIndividualProviderRefreshHasItsOwnDeadline() async {
+        let blocked = BlockingProvider()
+        let quick = QuickProvider()
+        let store = store([blocked, quick])
+        store.refresh(providerID: blocked.id)
+        await settle()
+        XCTAssertFalse(store.refreshing.contains(blocked.id))
+        XCTAssertEqual(store.snapshots.first { $0.id == blocked.id }?.status, .error("no response"))
+        XCTAssertEqual(store.diagnostics[blocked.id]?.failure?.kind, .timedOut)
+        await store.refresh(providerID: quick.id)?.value
+        XCTAssertEqual(quick.calls, 1)
+        XCTAssertEqual(blocked.calls, 1)
+        blocked.release()
+        await settle(0.1)
+        store.stop()
+    }
 
     func testASuccessfulPassReleasesTheFlag() async {
         let store = store([QuickProvider()])

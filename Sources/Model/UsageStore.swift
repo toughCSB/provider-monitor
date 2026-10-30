@@ -141,6 +141,11 @@ final class UsageStore: ObservableObject {
     /// its late answer overwriting a newer one.
     private let refreshDeadline: TimeInterval
     private var deadlineTask: Task<Void, Never>?
+    /// A late completion may only finish the pass that created it.
+    private var refreshGeneration: UInt64 = 0
+    @Published private(set) var diagnostics: [String: UsageDiagnostic] = [:]
+    private var retryTasks: [String: Task<Void, Never>] = [:]
+    private var fetchDeadlineTasks: [String: Task<Void, Never>] = [:]
 
     init(
         providers: [UsageProvider],
@@ -246,7 +251,8 @@ final class UsageStore: ObservableObject {
                             ringCadences: Self.ringCadences(
                                 in: reportedWindows[provider.id] ?? [],
                                 weeklyID: reportedWeekly[provider.id],
-                                provider: provider))
+                                provider: provider),
+                            connectionNote: diagnostics[provider.id]?.failure?.message(at: Date()))
             return [summary] + models.filter { $0.sourceProviderID == provider.id }
         }
         return ProviderOrder.arrange(summaries, by: order, id: \.id)
@@ -301,9 +307,12 @@ final class UsageStore: ObservableObject {
         localTimer?.invalidate()
         localTimer = nil
         refreshTask?.cancel()
+        for task in retryTasks.values { task.cancel() }
+        retryTasks.removeAll()
         for id in Array(fetchTasks.keys) { cancelRefresh(providerID: id) }
         deadlineTask?.cancel()
         deadlineTask = nil
+        refreshGeneration &+= 1
         isRefreshing = false
         // Block-based observers are not removed by `removeObserver(self)`.
         if let languageObserver {
@@ -367,24 +376,26 @@ final class UsageStore: ObservableObject {
             return
         }
         isRefreshing = true
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
         lastAttempt = pollingNow()
         refreshTask = Task { [weak self] in
             await self?.refresh()
-            self?.finish()
+            self?.finish(generation: generation)
         }
-        armDeadline()
+        armDeadline(generation: generation)
     }
 
     /// Stops waiting for a pass that has not come back, so the next tick can
     /// run. Deliberately does not touch the pass itself — there is nothing here
     /// that could stop it.
-    private func armDeadline() {
+    private func armDeadline(generation: UInt64) {
         let deadline = refreshDeadline
         deadlineTask?.cancel()
         deadlineTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            self?.abandon()
+            self?.abandon(generation: generation)
         }
     }
 
@@ -396,7 +407,8 @@ final class UsageStore: ObservableObject {
     /// removes itself from it as it lands, so a second write here would only
     /// ever repeat what that one just did — or clear a cell that a
     /// single-provider refresh still genuinely owns.
-    private func finish() {
+    private func finish(generation: UInt64) {
+        guard refreshGeneration == generation else { return }
         deadlineTask?.cancel()
         deadlineTask = nil
         isRefreshing = false
@@ -408,8 +420,8 @@ final class UsageStore: ObservableObject {
     /// path as any other failure: a remembered reading is re-shown and ages,
     /// and a provider with nothing to show says it got no response. Then frees
     /// the flag so the schedule resumes.
-    private func abandon() {
-        guard isRefreshing else { return }
+    private func abandon(generation: UInt64) {
+        guard isRefreshing, refreshGeneration == generation else { return }
         // Whatever is still in the task table never answered. The tasks are
         // left exactly where they are: a provider is an actor, so cancelling
         // one that is blocked inside a synchronous keychain call changes
@@ -420,18 +432,7 @@ final class UsageStore: ObservableObject {
         Log.usage.error("refresh abandoned after \(self.refreshDeadline, format: .fixed(precision: 0))s; no answer from: \(stuck.joined(separator: ", "), privacy: .public)")
         for id in stuck {
             guard let provider = providers.first(where: { $0.id == id }) else { continue }
-            // The same two outcomes any other failure has: a provider worth
-            // showing without a reading ages in place, one that is not drops
-            // out of the notch entirely.
-            if let stale = degraded(provider: provider, error: UsageProviderError.timedOut) {
-                publish(stale)
-            } else {
-                snapshots.removeAll { $0.id == id }
-            }
-            // Only the cells this pass gave up on. Clearing the whole set
-            // would take the spinner off work a newer pass is genuinely still
-            // doing — every other provider clears its own entry as it lands.
-            refreshing.remove(id)
+            abandonFetch(provider, generation: generations[id, default: 0])
         }
         isRefreshing = false
     }
@@ -489,7 +490,20 @@ final class UsageStore: ObservableObject {
 
     private func beginRefresh(_ provider: UsageProvider, holdIndicator: Bool = false) -> Task<Void, Never> {
         if let task = fetchTasks[provider.id] { return task }
+        if !provider.canRefreshDuringBackoff,
+           let retryAt = diagnostics[provider.id]?.failure?.retryAt, retryAt > Date() {
+            return Task {}
+        }
         let generation = generations[provider.id, default: 0]
+        var diagnostic = diagnostics[provider.id] ?? UsageDiagnostic(providerID: provider.id)
+        if diagnostic.measuredAt == nil {
+            diagnostic.measuredAt = lastGood[provider.id]?.fetchedAt
+            diagnostic.source = lastGood[provider.id]?.snapshot.observation?.source
+        }
+        diagnostic.lastAttemptAt = Date()
+        diagnostic.inFlight = true
+        diagnostic.attempts += 1
+        diagnostics[provider.id] = diagnostic
         refreshing.insert(provider.id)
         let task = Task { [weak self] in
             guard let self else { return }
@@ -502,12 +516,37 @@ final class UsageStore: ObservableObject {
             guard generations[provider.id, default: 0] == generation else { return }
             refreshing.remove(provider.id)
             fetchTasks.removeValue(forKey: provider.id)
+            fetchDeadlineTasks.removeValue(forKey: provider.id)?.cancel()
+            diagnostics[provider.id]?.inFlight = false
+            UsageDiagnostics.persist(diagnostics)
         }
         fetchTasks[provider.id] = task
+        let deadline = refreshDeadline
+        fetchDeadlineTasks[provider.id] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, deadline) * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.abandonFetch(provider, generation: generation)
+        }
         return task
     }
 
+    /// Also protects an individual/manual refresh when no global pass is running.
+    /// The underlying blocked call remains registered so retries cannot pile up.
+    private func abandonFetch(_ provider: UsageProvider, generation: Int) {
+        guard acceptsResult(from: provider, generation: generation),
+              fetchTasks[provider.id] != nil, refreshing.contains(provider.id) else { return }
+        if let stale = degraded(provider: provider, error: UsageProviderError.timedOut) {
+            publish(stale)
+        } else {
+            snapshots.removeAll { $0.id == provider.id }
+        }
+        refreshing.remove(provider.id)
+    }
+
     private func cancelRefresh(providerID: String) {
+        fetchDeadlineTasks.removeValue(forKey: providerID)?.cancel()
+        retryTasks.removeValue(forKey: providerID)?.cancel()
+        diagnostics[providerID]?.inFlight = false
         generations[providerID, default: 0] += 1
         fetchTasks.removeValue(forKey: providerID)?.cancel()
         refreshing.remove(providerID)
@@ -541,6 +580,8 @@ final class UsageStore: ObservableObject {
         refusedAccess.remove(providerID)
         snapshots.removeAll { $0.id == providerID }
         lastGood.removeValue(forKey: providerID)
+        diagnostics.removeValue(forKey: providerID)
+        UsageDiagnostics.persist(diagnostics)
         archive.forget(providerID)
 
         Task { await provider.signOut() }
@@ -749,24 +790,47 @@ final class UsageStore: ObservableObject {
         // A scheduled task can be disconnected before it begins; avoid reading
         // its credential at all, as well as rejecting an obsolete response.
         guard acceptsResult(from: provider, generation: generation) else { return nil }
+        let accountBefore = provider.usageAccountID
+        forgetChangedAccount(providerID: provider.id, current: accountBefore)
         do {
-            let fresh = try await provider.fetchSnapshot()
+            var fresh = try await provider.fetchSnapshot()
             guard acceptsResult(from: provider, generation: generation) else { return nil }
+            let accountAfter = provider.usageAccountID
+            guard accountBefore == accountAfter else { throw UsageProviderError.accountChanged }
             // Model residency becomes untrue as soon as a server stops. It must
             // never use quota's last-good cache or survive an app relaunch.
             if provider.kind == .usage {
-                lastGood[provider.id] = (fresh, Date())
+                let now = Date()
+                var observation = fresh.observation ?? UsageObservation(
+                    measuredAt: fresh.status.staleSince ?? now, source: .provider)
+                observation.accountID = accountAfter
+                fresh.observation = observation
+                if fresh.status == .ok, now.timeIntervalSince(observation.measuredAt) > staleAfter {
+                    fresh.status = .stale(since: observation.measuredAt)
+                }
+                lastGood[provider.id] = (fresh, observation.measuredAt)
                 archive.save(lastGood)
             }
+            fresh.connectionFailure = nil
+            var diagnostic = diagnostics[provider.id] ?? UsageDiagnostic(providerID: provider.id)
+            diagnostic.lastSuccessfulReadAt = Date()
+            diagnostic.measuredAt = fresh.observation?.measuredAt
+            diagnostic.source = fresh.observation?.source
+            diagnostic.failure = nil
+            diagnostics[provider.id] = diagnostic
+            retryTasks.removeValue(forKey: provider.id)?.cancel()
             refusedAccess.remove(provider.id)
             // A reading that actually came back is proof the credential works,
             // whatever was thought a moment ago. The only way this clears —
             // there is no timer and nothing retries.
             needsRenewal.remove(provider.id)
-            Log.usage.debug("\(provider.id, privacy: .public): \(fresh.windows.count) window(s)")
+            if let observation = fresh.observation {
+                Log.usage.notice("\(provider.id, privacy: .public): source=\(observation.source.rawValue, privacy: .public), measurement age=\(Int(max(0, Date().timeIntervalSince(observation.measuredAt))), privacy: .public)s")
+            }
             return fresh
         } catch {
             guard acceptsResult(from: provider, generation: generation) else { return nil }
+            forgetChangedAccount(providerID: provider.id, current: provider.usageAccountID)
             if provider.kind == .localRuntime {
                 var empty = Self.placeholder(provider)
                 empty.status = .error(error.localizedDescription)
@@ -777,6 +841,14 @@ final class UsageStore: ObservableObject {
         }
     }
 
+    private func forgetChangedAccount(providerID: String, current: String?) {
+        guard let previous = lastGood[providerID]?.snapshot.observation?.accountID,
+              previous != current else { return }
+        lastGood.removeValue(forKey: providerID)
+        archive.forget(providerID)
+        snapshots.removeAll { $0.id == providerID }
+    }
+
     private func acceptsResult(from provider: UsageProvider, generation: Int) -> Bool {
         !Task.isCancelled && !disconnected.contains(provider.id)
             && generations[provider.id, default: 0] == generation
@@ -785,6 +857,12 @@ final class UsageStore: ObservableObject {
     /// A failed fetch never invents a number: it either re-shows the last good
     /// one marked stale, or shows the cell with no reading at all.
     private func degraded(provider: UsageProvider, error: Error) -> ProviderSnapshot? {
+        let failure = UsageFailure(error)
+        var diagnostic = diagnostics[provider.id] ?? UsageDiagnostic(providerID: provider.id)
+        diagnostic.failure = failure
+        diagnostics[provider.id] = diagnostic
+        scheduleRetry(providerID: provider.id, failure: failure)
+        UsageDiagnostics.persist(diagnostics)
         if !provider.isVisibleWhenAbsent {
             lastGood[provider.id] = nil
             archive.save(lastGood)
@@ -792,6 +870,9 @@ final class UsageStore: ObservableObject {
         }
 
         let status = Self.status(for: error)
+        let sameAccount = lastGood[provider.id]?.snapshot.observation?.accountID.map {
+            $0 == provider.usageAccountID
+        } ?? false
 
         // Remembered apart from the snapshot on purpose. The snapshot answers
         // "how good are the numbers I am showing", and for a refusal the honest
@@ -810,17 +891,19 @@ final class UsageStore: ObservableObject {
         // through one of those would present a number that is no longer true —
         // and, after an endpoint change, one that came from somewhere we no
         // longer read. So the remembered reading is dropped, not dimmed.
-        if Self.supersedesHistory(status) {
+        if Self.supersedesHistory(status) && !(status == .needsAuth && sameAccount) {
             lastGood[provider.id] = nil
             archive.save(lastGood)
             var empty = Self.placeholder(provider)
             empty.status = status
+            empty.connectionFailure = failure
             return empty
         }
 
         guard let previous = lastGood[provider.id] else {
             var empty = Self.placeholder(provider)
             empty.status = status
+            empty.connectionFailure = failure
             return empty
         }
 
@@ -828,8 +911,33 @@ final class UsageStore: ObservableObject {
         // window it gets marked, and the ring dims.
         let age = Date().timeIntervalSince(previous.fetchedAt)
         var snapshot = previous.snapshot
-        snapshot.status = age > staleAfter ? .stale(since: previous.fetchedAt) : previous.snapshot.status
+        snapshot.connectionFailure = failure
+        snapshot.status = age > staleAfter || status == .needsAuth
+            ? .stale(since: previous.fetchedAt) : previous.snapshot.status
         return snapshot
+    }
+
+    /// Wake at the provider's retry deadline, rather than losing another idle
+    /// polling interval. Manual refresh uses the same gate and cannot bypass it.
+    private func scheduleRetry(providerID: String, failure: UsageFailure) {
+        retryTasks.removeValue(forKey: providerID)?.cancel()
+        guard let retryAt = failure.retryAt else { return }
+        let generation = generations[providerID, default: 0]
+        retryTasks[providerID] = Task { [weak self] in
+            let interval = min(max(0, retryAt.timeIntervalSinceNow), 24 * 3600)
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            if let pending = fetchTasks[providerID] { await pending.value }
+            guard !Task.isCancelled, !disconnected.contains(providerID),
+                  generations[providerID, default: 0] == generation,
+                  diagnostics[providerID]?.failure?.retryAt == retryAt else { return }
+            if retryAt > Date() {
+                scheduleRetry(providerID: providerID, failure: failure)
+            } else {
+                retryTasks.removeValue(forKey: providerID)
+                _ = refresh(providerID: providerID)
+            }
+        }
     }
 
     /// True when the new status makes any remembered reading untrue rather than
@@ -864,6 +972,8 @@ final class UsageStore: ObservableObject {
 
     private static func status(for error: Error) -> ProviderStatus {
         switch error {
+        case UsageProviderError.accountChanged:
+            return .error(L10n.t("Account changed during the request. Waiting for a new reading."))
         case UsageProviderError.needsAuth:
             return .needsAuth
         case UsageProviderError.credentialExpired:

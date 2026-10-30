@@ -100,11 +100,16 @@ enum ClaudeTranscript {
     /// rather than guessing.
     static func turn(inTail data: Data) -> Turn? {
         let lines = data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true)
-        for line in lines.reversed() {
+        for index in lines.indices.reversed() {
+            let line = lines[index]
             // The first line of the tail is usually cut in half; it fails to
-            // parse and is skipped, which is the whole handling it needs.
+            // parse and is skipped. A malformed later line may be a record
+            // still being appended, so an older finished turn is not proof.
             guard let json = (try? JSONSerialization.jsonObject(with: Data(line)))
-                    as? [String: Any] else { continue }
+                    as? [String: Any] else {
+                if index == lines.startIndex { continue }
+                return nil
+            }
             // A subagent's records are interleaved with its parent's, and the
             // parent's turn is the one being reported on.
             if json["isSidechain"] as? Bool == true { continue }
@@ -112,9 +117,14 @@ enum ClaudeTranscript {
             switch json["type"] as? String {
             case "assistant":
                 // `tool_use` is the only stop reason that means the turn goes
-                // on; `end_turn`, `stop_sequence` and `max_tokens` all end it.
+                // on; only an explicit end reason proves that it finished.
+                // A partially written assistant record cannot make a session idle.
                 let message = json["message"] as? [String: Any]
-                return message?["stop_reason"] as? String == "tool_use" ? .inFlight : .finished
+                switch message?["stop_reason"] as? String {
+                case "tool_use": return .inFlight
+                case "end_turn", "stop_sequence", "max_tokens": return .finished
+                default: return nil
+                }
             case "user":
                 return isInterruption(json) ? .finished : .inFlight
             default:
@@ -153,11 +163,14 @@ final class ClaudeTranscriptReader {
     private struct Cached {
         let modified: Date
         let size: UInt64
+        let fileNumber: UInt64?
         let turn: ClaudeTranscript.Turn?
     }
 
     private let projects: URL
     private let fileManager: FileManager
+    private let clock: () -> Date
+    private let negativeRetryInterval: TimeInterval
     /// Where each session's transcript turned out to be. Sessions come and go;
     /// this is bounded by how many have run since the app launched.
     private var paths: [String: URL] = [:]
@@ -171,31 +184,52 @@ final class ClaudeTranscriptReader {
     /// the notch means by `since` is when the state was entered, so the moment
     /// of the change is kept and the appends in between are ignored.
     private var entered: [String: (turn: ClaudeTranscript.Turn, at: Date)] = [:]
-    /// Sessions already looked for the hard way and not found. The directory
-    /// scan is worth doing once for a session that has moved, and never worth
-    /// repeating every two seconds for one that simply has no transcript.
-    private var scanned: Set<String> = []
+    /// A failed fallback scan is retried after a bounded delay. The direct
+    /// slug is still checked on every tick, so a new transcript there is immediate.
+    private var nextScan: [String: Date] = [:]
 
-    init(projects: URL, fileManager: FileManager = .default) {
+    init(projects: URL, fileManager: FileManager = .default,
+         negativeRetryInterval: TimeInterval = 30,
+         clock: @escaping () -> Date = Date.init) {
         self.projects = projects
         self.fileManager = fileManager
+        self.negativeRetryInterval = negativeRetryInterval
+        self.clock = clock
     }
 
     /// What the session is doing, and when it last moved. Nil when there is no
     /// transcript to read, or nothing said in it yet.
     func activity(sessionID: String, cwd: String) -> (turn: ClaudeTranscript.Turn, since: Date)? {
-        guard let url = path(sessionID: sessionID, cwd: cwd),
-              let attributes = try? fileManager.attributesOfItem(atPath: url.path),
-              let modified = attributes[.modificationDate] as? Date
-        else { return nil }
+        let now = clock()
+        guard var url = path(sessionID: sessionID, cwd: cwd, now: now) else { return nil }
+        var attributes = try? fileManager.attributesOfItem(atPath: url.path)
+        if attributes == nil {
+            // The file may have moved, or its directory may have been replaced.
+            // Discard state tied to the old file and search the fallback now.
+            paths.removeValue(forKey: sessionID)
+            cache.removeValue(forKey: sessionID)
+            entered.removeValue(forKey: sessionID)
+            guard let relocated = path(sessionID: sessionID, cwd: cwd,
+                                       now: now, forceScan: true) else { return nil }
+            url = relocated
+            attributes = try? fileManager.attributesOfItem(atPath: url.path)
+        }
+        guard let attributes,
+              let modified = attributes[.modificationDate] as? Date else { return nil }
         let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
 
         let turn: ClaudeTranscript.Turn?
-        if let cached = cache[sessionID], cached.modified == modified, cached.size == size {
+        if let cached = cache[sessionID], cached.modified == modified,
+           cached.size == size, cached.fileNumber == fileNumber {
             turn = cached.turn
         } else {
+            if let cached = cache[sessionID], cached.fileNumber != fileNumber {
+                entered.removeValue(forKey: sessionID)
+            }
             turn = ClaudeTranscript.turn(at: url)
-            cache[sessionID] = Cached(modified: modified, size: size, turn: turn)
+            cache[sessionID] = Cached(modified: modified, size: size,
+                                      fileNumber: fileNumber, turn: turn)
         }
 
         guard let turn else { return nil }
@@ -208,17 +242,25 @@ final class ClaudeTranscriptReader {
         return (turn, modified)
     }
 
-    private func path(sessionID: String, cwd: String) -> URL? {
+    private func path(sessionID: String, cwd: String, now: Date,
+                      forceScan: Bool = false) -> URL? {
         if let known = paths[sessionID] { return known }
-        let scanning = !scanned.contains(sessionID)
+        let direct = projects
+            .appendingPathComponent(ClaudeTranscript.projectSlug(forCWD: cwd))
+            .appendingPathComponent(sessionID + ".jsonl")
+        if fileManager.fileExists(atPath: direct.path) {
+            paths[sessionID] = direct
+            nextScan.removeValue(forKey: sessionID)
+            return direct
+        }
+        guard forceScan || now >= (nextScan[sessionID] ?? .distantPast) else { return nil }
+        nextScan[sessionID] = now.addingTimeInterval(negativeRetryInterval)
         guard let found = ClaudeTranscript.transcript(
             forSessionID: sessionID, cwd: cwd, in: projects,
-            scanning: scanning, fileManager: fileManager
-        ) else {
-            if scanning { scanned.insert(sessionID) }
-            return nil
-        }
+            scanning: true, fileManager: fileManager
+        ) else { return nil }
         paths[sessionID] = found
+        nextScan.removeValue(forKey: sessionID)
         return found
     }
 }

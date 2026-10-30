@@ -23,7 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: StatusItemController?
     /// Keeps the Claude keychain token from ageing out on a Mac where the CLI
     /// is never run by hand. See `ClaudeTokenRefresher`.
-    private var tokenRefresher: ClaudeTokenRefresher?
+    private var tokenRefreshers: [ClaudeTokenRefresher] = []
     /// Renews Grok's six-hour session the same way, by launching its CLI. See
     /// `GrokTokenRefresher`.
     private var grokTokenRefresher: GrokTokenRefresher?
@@ -729,35 +729,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // step over that pid, so it never reaches the notch and never counts as
         // work in progress.
         //
-        // Only the default profile is renewed. The command writes whichever
-        // directory `CLAUDE_CONFIG_DIR` names, so a second profile would need
-        // that passed through — behaviour nobody has been able to try on a Mac
-        // with two of them, and an unverified guess is worse here than a ring
-        // that ages the way it already does.
-        if let defaultProvider = claudeProviders.first(where: { $0.profile.slug == nil }) {
+        // Each profile's command receives its own configuration directory.
+        // No profile may refresh another account's token.
+        for provider in claudeProviders {
             let refresher = ClaudeTokenRefresher(
-                expiry: { await defaultProvider.tokenExpiry },
-                reload: { await defaultProvider.reloadTokenExpiry() }
+                expiry: { await provider.tokenExpiry },
+                reload: { await provider.reloadTokenExpiry() },
+                profile: provider.profile
             )
-            for monitor in claudeMonitors {
-                monitor.ignoredPIDs = { [weak refresher] in
-                    guard let pid = refresher?.launchedPID else { return [] }
-                    return [pid]
-                }
-            }
             // The one place the failure becomes visible. The store carries the
             // fact; nothing here retries, and the warning clears itself the
             // moment a reading comes back.
             refresher.$outcome
                 .receive(on: RunLoop.main)
                 .sink { [weak self] outcome in
-                    guard case .failed = outcome else { return }
-                    self?.store?.reportRenewalFailed(providerID: defaultProvider.id)
+                    if case .failed = outcome {
+                        self?.store?.reportRenewalFailed(providerID: provider.id)
+                    } else if case .refreshed = outcome {
+                        self?.store?.refresh(providerID: provider.id)
+                    }
                 }
                 .store(in: &cancellables)
 
             refresher.start()
-            tokenRefresher = refresher
+            tokenRefreshers.append(refresher)
+        }
+        for monitor in claudeMonitors {
+            monitor.ignoredPIDs = { [weak self] in
+                Set(self?.tokenRefreshers.compactMap(\.launchedPID) ?? [])
+            }
         }
 
         // Grok's session lives six hours and only its CLI renews it, so the same
@@ -770,8 +770,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             grokRefresher.$outcome
                 .receive(on: RunLoop.main)
                 .sink { [weak self] outcome in
-                    guard case .failed = outcome else { return }
-                    self?.store?.reportRenewalFailed(providerID: grokProvider.id)
+                    if case .failed = outcome {
+                        self?.store?.reportRenewalFailed(providerID: grokProvider.id)
+                    } else if case .refreshed = outcome {
+                        self?.store?.refresh(providerID: grokProvider.id)
+                    }
                 }
                 .store(in: &cancellables)
             grokRefresher.start()
@@ -1004,7 +1007,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         ollamaRelay?.configure(enabled: false, endpoint: OllamaEndpoint.defaultAddress)
         lmstudioMetrics?.stop()
-        tokenRefresher?.stop()
+        tokenRefreshers.forEach { $0.stop() }
         grokTokenRefresher?.stop()
         store?.stop()
         activityCoordinator?.stop()

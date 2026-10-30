@@ -158,4 +158,5 @@ struct ProviderSummary: Identifiable, Equatable {
     /// provider can answer, so a menu never lists a duration whose window it
     /// does not have.
     var ringCadences: [RingCadence] = []
+    var connectionNote: String? = nil
 }

@@ -407,20 +407,12 @@ fn window_rank(id: &str) -> u8 {
 }
 
 fn retry_after_secs(resp: &ureq::Response) -> Option<u64> {
-    let value = resp.header("retry-after")?.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(seconds);
-    }
-    chrono::DateTime::parse_from_rfc2822(value)
-        .ok()
-        .map(|date| (date.timestamp_millis() - now_ms() as i64).max(0) as u64 / 1000)
+    crate::polling::retry_after_hint_secs(resp.header("retry-after"), now_ms())
 }
 
 fn backoff_secs(attempt: u32, retry_after: Option<u64>) -> u64 {
     let doubled = BACKOFF_BASE_SECS.saturating_mul(1u64 << attempt.min(4));
-    doubled
-        .clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS)
-        .max(retry_after.unwrap_or(0))
+    crate::polling::backoff_secs(doubled.clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS), retry_after)
 }
 
 enum FetchErr {
@@ -511,7 +503,7 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
         }
         Err(FetchErr::RateLimited(seconds)) => {
             CONSECUTIVE_429.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            snap.backoff_until = now_ms() + seconds * 1000;
+            snap.backoff_until = crate::polling::deadline_ms(now_ms(), seconds);
             snap.status = if snap.windows.is_empty() {
                 "backoff"
             } else {
@@ -579,12 +571,12 @@ pub fn start(app: AppHandle) {
                 snapshot
             };
             let snapshot = read_once(&previous);
-            let hold = snapshot.backoff_until.saturating_sub(now_ms()) / 1000;
+            let deadline = snapshot.backoff_until;
             if snapshot.status == "error" || snapshot.status == "stale" {
                 crate::applog(&format!("glm: {}", snapshot.note));
             }
             broadcast(&app, snapshot);
-            sleep_interruptible(POLL_SECS.max(hold));
+            sleep_interruptible(crate::polling::poll_wait_secs(POLL_SECS, deadline, now_ms()));
         }
     });
 }
@@ -675,10 +667,11 @@ mod tests {
     }
 
     #[test]
-    fn backoff_doubles_and_caps_but_honours_a_larger_hint() {
+    fn backoff_doubles_and_server_hint_can_extend_it() {
         assert_eq!(backoff_secs(0, None), 60);
         assert_eq!(backoff_secs(2, None), 240);
         assert_eq!(backoff_secs(99, None), 900);
         assert_eq!(backoff_secs(0, Some(600)), 600);
+        assert_eq!(backoff_secs(3, Some(2)), 480);
     }
 }

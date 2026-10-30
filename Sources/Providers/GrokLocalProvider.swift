@@ -13,7 +13,13 @@ actor GrokLocalProvider: UsageProvider {
 
     private let creditsURL = URL(string: "https://cli-chat-proxy.grok.com/v1/billing?format=credits")!
     private let session: URLSession
-    private let authURL: URL
+    nonisolated private let authURL: URL
+    nonisolated var usageAccountID: String? {
+        guard let credential = try? GrokCredentials.load(from: authURL),
+              let identity = (CodexCredentials.claims(inJWT: credential.accessToken)?["sub"] as? String)
+                ?? credential.email, !identity.isEmpty else { return nil }
+        return UsageAccountIdentity.fingerprint("grok:\(GrokCredentials.trustedIssuer):\(identity)")
+    }
 
     init(session: URLSession = .shared, authURL: URL = GrokCredentials.authURL) {
         self.session = session
@@ -24,7 +30,7 @@ actor GrokLocalProvider: UsageProvider {
         .guidance(L10n.t("Run grok login — it signs in and refreshes the token this reads."))
     }
 
-    nonisolated func account() -> ProviderAccount? { GrokCredentials.account() }
+    nonisolated func account() -> ProviderAccount? { GrokCredentials.account(from: authURL) }
 
     /// The saved session's expiry, read from disk. The refresher asks this on
     /// every tick and again after a launch, so it is deliberately the cheapest

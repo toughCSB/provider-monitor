@@ -66,11 +66,6 @@ pub fn refresh_menu(app: &AppHandle) {
 fn handle(app: &AppHandle, id: &str) {
     match id {
         "refresh" => {
-            {
-                let st = app.state::<crate::AppState>();
-                let mut u = st.usage.lock().unwrap();
-                u.backoff_until = 0;
-            }
             crate::usage::request_refresh();
             crate::codex::request_refresh();
             crate::cursor::request_refresh();
