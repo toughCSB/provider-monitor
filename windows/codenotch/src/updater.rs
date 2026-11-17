@@ -11,9 +11,11 @@
 //! user, who sees its window) does the rest.
 
 use serde::Serialize;
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 const FORK_REPO: &str = "toughCSB/provider-monitor";
@@ -23,6 +25,9 @@ const UPSTREAM_REPO: &str = "vinzdg/codenotch";
 /// rolling `preview` tag both fail this prefix, which is exactly what is wanted — neither is a
 /// stable release to install from.
 const TAG_PREFIX: &str = "v";
+const INSTALLER_NAME: &str = "Provider-Monitor-Setup.exe";
+const MAX_INSTALLER_BYTES: u64 = 512 * 1024 * 1024;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Serialize, Default)]
 pub struct UpdateInfo {
@@ -35,6 +40,7 @@ pub struct UpdateInfo {
     pub html_url: String,
     pub asset_url: String,
     pub asset_name: String,
+    pub asset_size: u64,
     pub error: String,
 }
 
@@ -77,6 +83,23 @@ struct GhRelease {
 struct GhAsset {
     name: String,
     browser_download_url: String,
+    #[serde(default)]
+    size: u64,
+}
+
+fn installable_asset(release: &GhRelease) -> Option<&GhAsset> {
+    let version = release.tag_name.strip_prefix(TAG_PREFIX)?;
+    if release.draft || release.prerelease || version.split('.').count() != 3
+        || !version.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let expected_url = format!(
+        "https://github.com/{FORK_REPO}/releases/download/{}/{INSTALLER_NAME}", release.tag_name
+    );
+    release.assets.iter().find(|asset| {
+        asset.name == INSTALLER_NAME && asset.browser_download_url == expected_url
+            && (1..=MAX_INSTALLER_BYTES).contains(&asset.size)
+    })
 }
 
 /// `1.2.10` beats `1.2.9`: each dot-separated run of leading digits compares as a number, not as
@@ -103,7 +126,7 @@ fn newer(a: &str, b: &str) -> bool {
 const MAX_PAGES: u32 = 4;
 const PER_PAGE: u32 = 30;
 
-fn fetch_latest() -> Result<(String, String, Option<GhAsset>), String> {
+fn fetch_latest() -> Result<(String, String, GhAsset), String> {
     let mut last_err = "no release with a Windows installer found".to_string();
     for page in 1..=MAX_PAGES {
         let url = format!("https://api.github.com/repos/{FORK_REPO}/releases?per_page={PER_PAGE}&page={page}");
@@ -117,12 +140,13 @@ fn fetch_latest() -> Result<(String, String, Option<GhAsset>), String> {
         if releases.is_empty() {
             break; // fewer releases than MAX_PAGES * PER_PAGE: nothing further to fetch
         }
-        if let Some(rel) = releases.into_iter().find(|r| !r.draft && !r.prerelease && r.tag_name.starts_with(TAG_PREFIX)) {
-            let asset = rel
-                .assets
-                .into_iter()
-                .find(|a| a.name.to_lowercase().ends_with("-setup.exe") || a.name.to_lowercase().ends_with(".exe"));
-            return Ok((rel.tag_name, rel.html_url, asset));
+        for rel in releases {
+            if let Some(asset) = installable_asset(&rel) {
+                return Ok((rel.tag_name.clone(), rel.html_url.clone(), GhAsset {
+                    name: asset.name.clone(), browser_download_url: asset.browser_download_url.clone(),
+                    size: asset.size,
+                }));
+            }
         }
         last_err = format!("no Windows installer found in the {} most recent releases", page * PER_PAGE);
     }
@@ -179,10 +203,9 @@ pub fn check(app: &AppHandle) -> UpdateInfo {
             info.available = newer(&latest, &current);
             info.latest = latest;
             info.html_url = html_url;
-            if let Some(a) = asset {
-                info.asset_url = a.browser_download_url;
-                info.asset_name = a.name;
-            }
+            info.asset_url = asset.browser_download_url;
+            info.asset_name = asset.name;
+            info.asset_size = asset.size;
         }
         Err(e) => info.error = e,
     }
@@ -197,6 +220,7 @@ pub fn check(app: &AppHandle) -> UpdateInfo {
 /// settings window's own "Check now" button reruns `check` directly and awaits it.
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
+        cleanup_old_installers(&installer_directory(), SystemTime::now());
         std::thread::sleep(Duration::from_secs(20));
         check(&app);
         check_upstream(&app);
@@ -210,7 +234,11 @@ pub fn download_and_launch(app: &AppHandle) -> Result<(), String> {
     // Never accept a URL from the page. Only the asset returned by this fork's last successful
     // release check may become executable; the original-project check has no asset field at all.
     let info = last();
-    if !info.available || info.asset_url.is_empty() {
+    if !info.available || info.asset_name != INSTALLER_NAME
+        || !(1..=MAX_INSTALLER_BYTES).contains(&info.asset_size)
+        || info.asset_url != format!(
+            "https://github.com/{FORK_REPO}/releases/download/v{}/{INSTALLER_NAME}", info.latest
+        ) {
         return Err("no installable update for this Windows app was checked".into());
     }
     let resp = ureq::get(&info.asset_url)
@@ -218,17 +246,24 @@ pub fn download_and_launch(app: &AppHandle) -> Result<(), String> {
         .timeout(Duration::from_secs(120))
         .call()
         .map_err(|e| format!("download failed: {e}"))?;
-    let mut bytes = Vec::new();
-    resp.into_reader().read_to_end(&mut bytes).map_err(|e| format!("download failed: {e}"))?;
-    if bytes.is_empty() {
-        return Err("downloaded file is empty".into());
+    let (path, mut file) = unique_installer_file()?;
+    let result = (|| {
+        copy_installer(resp.into_reader(), &mut file, info.asset_size)?;
+        file.flush().map_err(|e| format!("could not save installer: {e}"))?;
+        drop(file);
+        std::process::Command::new(&path)
+            .spawn()
+            .map_err(|e| format!("could not start the installer: {e}"))
+    })();
+    match result {
+        Ok(_) => {},
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
     }
-    let name = if info.asset_name.is_empty() { "Provider-Monitor-Setup.exe" } else { &info.asset_name };
-    let path = std::env::temp_dir().join(name);
-    std::fs::write(&path, &bytes).map_err(|e| format!("could not save installer: {e}"))?;
-    std::process::Command::new(&path)
-        .spawn()
-        .map_err(|e| format!("could not start the installer: {e}"))?;
+    // The app exits while NSIS is still using the file. Reclaim old owned
+    // downloads on a later launch, not in a thread that dies with this process.
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(400));
@@ -237,9 +272,77 @@ pub fn download_and_launch(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn installer_directory() -> std::path::PathBuf {
+    std::env::temp_dir().join("provider-monitor-updates-v1")
+}
+
+fn cleanup_old_installers(directory: &std::path::Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(directory) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(numbers) = name.strip_prefix("Provider-Monitor-Setup-").and_then(|s| s.strip_suffix(".exe")) else { continue };
+        let parts: Vec<_> = numbers.split('-').collect();
+        if parts.len() != 3 || !parts.iter().all(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())) { continue; }
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
+        let old = entry.metadata().ok().and_then(|m| m.modified().ok())
+            .and_then(|time| now.duration_since(time).ok())
+            .is_some_and(|age| age >= Duration::from_secs(24 * 3600));
+        if old { let _ = std::fs::remove_file(entry.path()); }
+    }
+}
+
+fn unique_installer_file() -> Result<(std::path::PathBuf, std::fs::File), String> {
+    let directory = installer_directory();
+    std::fs::create_dir_all(&directory).map_err(|e| format!("could not create installer directory: {e}"))?;
+    for _ in 0..10 {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("clock error: {e}"))?.as_nanos();
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            "Provider-Monitor-Setup-{}-{stamp}-{sequence}.exe", std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("could not save installer: {error}")),
+        }
+    }
+    Err("could not reserve a unique installer file".into())
+}
+
+fn copy_installer(mut input: impl Read, output: &mut impl Write, expected_size: u64) -> Result<(), String> {
+    if !(1..=MAX_INSTALLER_BYTES).contains(&expected_size) {
+        return Err("invalid installer size".into());
+    }
+    let copied = std::io::copy(&mut input.by_ref().take(expected_size + 1), output)
+        .map_err(|e| format!("download failed: {e}"))?;
+    if copied != expected_size {
+        return Err("downloaded installer does not match its published size".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::newer;
+    use super::{copy_installer, installable_asset, newer, unique_installer_file, GhRelease};
+
+    #[test]
+    fn cleanup_preserves_recent_downloads_and_unrelated_files() {
+        let dir = std::env::temp_dir().join(format!("pm-cleanup-test-{}-{:?}",std::process::id(),super::TEMP_SEQUENCE.fetch_add(1,std::sync::atomic::Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let owned = dir.join("Provider-Monitor-Setup-1-123456-1.exe");
+        let unrelated = dir.join("user-installer.exe");
+        std::fs::write(&owned,b"fixture").unwrap();
+        std::fs::write(&unrelated,b"fixture").unwrap();
+        let now = std::time::SystemTime::now();
+        super::cleanup_old_installers(&dir,now);
+        assert!(owned.exists());
+        super::cleanup_old_installers(&dir,now+std::time::Duration::from_secs(48*3600));
+        assert!(!owned.exists());
+        assert!(unrelated.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_higher_version_is_newer() {
@@ -265,5 +368,50 @@ mod tests {
     #[test]
     fn the_current_shipped_release_is_not_flagged_as_an_update() {
         assert!(!newer(env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn missing_installer_and_unrelated_exe_are_not_installable() {
+        let release: GhRelease = serde_json::from_str(r#"{
+            "tag_name":"v2.3.4", "html_url":"https://example.invalid/release",
+            "assets":[
+                {"name":"ProviderMonitor-2.3.4-unsigned.dmg", "browser_download_url":"https://example.invalid/mac", "size":100},
+                {"name":"Other-Setup.exe", "browser_download_url":"https://example.invalid/other", "size":100},
+                {"name":"Provider-Monitor-Setup.exe", "browser_download_url":"https://example.invalid/wrong-origin", "size":100}
+            ]
+        }"#).unwrap();
+        assert!(installable_asset(&release).is_none());
+    }
+
+    #[test]
+    fn exact_fork_installer_requires_published_size() {
+        let release: GhRelease = serde_json::from_str(r#"{
+            "tag_name":"v2.3.4", "html_url":"https://example.invalid/release",
+            "assets":[{"name":"Provider-Monitor-Setup.exe",
+              "browser_download_url":"https://github.com/toughCSB/provider-monitor/releases/download/v2.3.4/Provider-Monitor-Setup.exe",
+              "size":123}]
+        }"#).unwrap();
+        assert_eq!(installable_asset(&release).unwrap().size, 123);
+    }
+
+    #[test]
+    fn streamed_download_rejects_truncation_and_extra_bytes() {
+        let mut exact = Vec::new();
+        copy_installer(&b"abc"[..], &mut exact, 3).unwrap();
+        assert_eq!(exact, b"abc");
+        assert!(copy_installer(&b"ab"[..], &mut Vec::new(), 3).is_err());
+        assert!(copy_installer(&b"abcd"[..], &mut Vec::new(), 3).is_err());
+    }
+
+    #[test]
+    fn simultaneous_downloads_get_distinct_owned_temp_files() {
+        let (first, first_file) = unique_installer_file().unwrap();
+        let (second, second_file) = unique_installer_file().unwrap();
+        assert_ne!(first, second);
+        assert!(first.exists() && second.exists());
+        drop(first_file);
+        drop(second_file);
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
     }
 }

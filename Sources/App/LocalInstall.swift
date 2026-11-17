@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 /// Installs the build that is currently running. The network updater uses the
 /// same atomic bundle swap after it mounts a downloaded release image.
@@ -95,10 +96,15 @@ enum AppBundleInstaller {
             at: destination.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let staging = destination.deletingLastPathComponent()
-            .appendingPathComponent(".(destination.lastPathComponent).(ProcessInfo.processInfo.processIdentifier)")
-        try? FileManager.default.removeItem(at: staging)
-        defer { try? FileManager.default.removeItem(at: staging) }
+        // Reserve a private sibling directory. Another install (or an older build's
+        // fixed staging path) must never be removed by this attempt's cleanup.
+        let stagingDirectory = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\(destination.lastPathComponent).install-\(UUID().uuidString)")
+        guard mkdir(stagingDirectory.path, 0o700) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
+        let staging = stagingDirectory.appendingPathComponent(destination.lastPathComponent)
 
         let ditto = Process()
         ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")

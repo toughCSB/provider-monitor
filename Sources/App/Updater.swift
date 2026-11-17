@@ -14,6 +14,7 @@ final class Updater: ObservableObject {
         let pageURL: URL
         let assetURL: URL
         let sha256: String?
+        let expectedSize: Int64?
     }
 
     enum Outcome: Equatable {
@@ -173,6 +174,7 @@ final class Updater: ObservableObject {
                 let name: String
                 let browser_download_url: URL
                 let digest: String?
+                let size: Int64?
             }
             let tag_name: String
             let html_url: URL
@@ -183,14 +185,13 @@ final class Updater: ObservableObject {
         let version = decoded.tag_name.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
         guard let asset = decoded.assets.first(where: {
             $0.name == "ProviderMonitor-\(version)-unsigned.dmg"
-        }) ?? decoded.assets.first(where: {
-            $0.name.hasPrefix("ProviderMonitor-") && $0.name.hasSuffix(".dmg")
         }) else {
             throw ProviderUpdateError.missingDiskImage
         }
         let digest = asset.digest?.replacingOccurrences(of: "sha256:", with: "")
         return Release(version: version, pageURL: decoded.html_url,
-                       assetURL: asset.browser_download_url, sha256: digest)
+                       assetURL: asset.browser_download_url, sha256: digest,
+                       expectedSize: asset.size)
     }
 
     private nonisolated static func fetchLatest(using session: URLSession) async throws -> Release {
@@ -205,16 +206,27 @@ final class Updater: ObservableObject {
     private nonisolated static func download(_ release: Release,
                                              using session: URLSession) async throws -> URL {
         let (temporary, response) = try await session.download(from: release.assetURL)
-        try requireSuccess(response)
+        do {
+            try requireSuccess(response)
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
         guard let expected = release.sha256, expected.count == 64 else {
+            try? FileManager.default.removeItem(at: temporary)
             throw ProviderUpdateError.missingDigest
         }
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("ProviderMonitor-\(release.version)-\(UUID().uuidString).dmg")
         try FileManager.default.moveItem(at: temporary, to: destination)
         do {
-            let data = try Data(contentsOf: destination, options: .mappedIfSafe)
-            let actual = sha256(of: data)
+            if let expectedSize = release.expectedSize {
+                let actualSize = try destination.resourceValues(forKeys: [.fileSizeKey]).fileSize
+                guard expectedSize > 0, actualSize.map(Int64.init) == expectedSize else {
+                    throw ProviderUpdateError.sizeMismatch
+                }
+            }
+            let actual = try sha256(ofFile: destination)
             guard actual.caseInsensitiveCompare(expected) == .orderedSame else {
                 throw ProviderUpdateError.digestMismatch
             }
@@ -233,6 +245,16 @@ final class Updater: ObservableObject {
 
     nonisolated static func sha256(of data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    nonisolated static func sha256(ofFile url: URL) throws -> String {
+        let input = try FileHandle(forReadingFrom: url)
+        defer { try? input.close() }
+        var digest = SHA256()
+        while let chunk = try input.read(upToCount: 1024 * 1024), !chunk.isEmpty {
+            digest.update(data: chunk)
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private nonisolated static func installDiskImage(at image: URL) throws -> URL {
@@ -280,6 +302,7 @@ private enum ProviderUpdateError: LocalizedError {
     case badResponse(Int?)
     case missingDiskImage
     case missingDigest
+    case sizeMismatch
     case digestMismatch
     case couldNotMount
     case missingApplication
@@ -294,6 +317,8 @@ private enum ProviderUpdateError: LocalizedError {
             return "The latest release has no Provider Monitor disk image."
         case .missingDigest:
             return "The latest release has no SHA-256 checksum."
+        case .sizeMismatch:
+            return "The downloaded update does not match its published size."
         case .digestMismatch:
             return "The downloaded update did not match its published SHA-256 checksum."
         case .couldNotMount:
