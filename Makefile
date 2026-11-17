@@ -66,7 +66,7 @@ DEV_SIGN := CODE_SIGN_IDENTITY="Apple Development" CODE_SIGN_STYLE=Manual \
 endif
 endif
 
-.PHONY: gen build test test-ci verify-deps run install clean
+.PHONY: gen build test test-ci test-ui verify-deps run install clean
 
 gen:
 	xcodegen generate
@@ -78,7 +78,7 @@ build: gen
 		-derivedDataPath '$(LOCAL_DERIVED)' \
 		-configuration Debug $(DEV_SIGN) build
 
-test: gen
+test: gen test-ui
 	@status=0; xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
 		-derivedDataPath '$(TEST_DERIVED)' -configuration Debug $(DEV_SIGN) test || status=$$?; \
 	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
@@ -88,13 +88,16 @@ test: gen
 # Continuous integration: no Developer ID identity exists on a CI runner, and
 # unit tests need none — override the manual signing with plain unsigned
 # builds rather than asking every contributor to hold a certificate.
-test-ci: gen
+test-ci: gen test-ui
 	@status=0; xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
 		-derivedDataPath '$(TEST_DERIVED)' -configuration Debug test \
 		CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO || status=$$?; \
 	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
 		-u '$(TEST_DERIVED)/Build/Products/Debug/Provider Monitor.app' 2>/dev/null || true; \
 	exit $$status
+
+test-ui:
+	@set -e; for script in windows/scripts/check-*.mjs; do node "$$script"; done
 
 verify-deps:
 	rm -rf $(PROJECT)

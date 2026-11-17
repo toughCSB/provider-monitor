@@ -13,9 +13,9 @@
 - **`windows/`는 upstream과 합치지 않는다.** upstream에도 Windows 포트가 있지만 이 포크의 포트와는
   같은 기능을 각자 구현한 **다른 코드**다. 파일 단위로 섞으면 컴파일도 안 되고, 애써 맞춘 화면도
   무너진다. upstream Windows 수정 중 필요한 것만 골라 손으로 옮긴다.
-- **`windows/`의 실질 검증은 GitHub Actions에서만 가능하다.** `rustup`도 크로스 타깃도 없는 맥에서는
-  `cargo`가 Windows용 코드를 컴파일하지 못한다. `.github/workflows/windows-package.yml`을
-  `workflow_dispatch`로 돌려 컴파일 + 설치 + `doctor` + 제거까지 확인한다.
+- **Windows 검증은 Windows 호스트에서 한다.** 현재 GitHub workflow는 삭제된 상태다.
+  SV 등 연결 가능한 Windows에서 `cargo test --locked -p codenotch`와 NSIS 빌드를 실행하고,
+  사용자 데스크톱 세션에서 설치·실행·사용량을 확인한다. Mac의 Node 검사만으로 네이티브 검증을 대체하지 않는다.
 
 ## 파일별 충돌 정책
 
@@ -24,9 +24,9 @@
 | `Sources/**` (macOS 앱) | upstream 채택, 우리 의도적 변경은 유지 | 같은 코드베이스의 포크다 |
 | `Sources/Settings/RingCadence.swift` 같은 포크 전용 파일 | 우리 것 유지 | upstream에 없다 |
 | `Sources/Localizable.xcstrings` | 키 **합집합**. 같은 키는 `ko`가 있는 우리 것 유지 | 번역을 잃지 않는다 |
-| `.github/workflows/**` | upstream 채택 | CI 정의는 원본을 따른다 |
+| `.github/workflows/**` | 현재 삭제 유지 | 복원은 별도 결정이다. upstream 병합만으로 복원하지 않는다 |
 | `site/**` | 우리 쪽은 비워 둔다(삭제를 유지한다) | upstream이 서명·공증한 dmg와 appcast를 넣는 자리라 포크에서는 쓸 일이 없다. 이 포크는 GitHub Pages를 쓰지 않는다 |
-| `windows/**` | **우리 것 유지** — `git checkout HEAD -- windows/` | 위 참조 |
+| `windows/**` | **현재 작업본 보존** | 미커밋 구현이 있으므로 `git checkout HEAD -- windows/`로 덮어쓰지 않는다 |
 | `project.yml` | downstream 버전·번들 ID·GitHub 릴리스 업데이트 정책은 우리 것, upstream 설정 변경은 채택 | |
 
 같은 키라도 **upstream이 더 새것이면 upstream 값을 택한다.** 이번에 `%lld%% of its %@ limit used.`의
@@ -62,11 +62,10 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
 make test          # 0 failures
 ```
 
-Windows는 맥에서 컴파일할 수 없으므로 CI로 넘긴다:
+Mac에서 공통 화면 검사를 실행한다. `make test`와 `make test-ci`에도 연결되어 있다:
 
 ```bash
-gh workflow run windows-package.yml --repo toughCSB/provider-monitor --ref <브랜치>
-gh run watch --repo toughCSB/provider-monitor
+make test-ui
 ```
 
 ## 이번 병합(1.13.1)에서 실제로 내린 판단
@@ -102,9 +101,10 @@ make publish      # 이미 있는 태그의 릴리스에 dmg 첨부
 둘 다 있어야 한다. 없으면 `make dmg-ci`로 만든 dmg를 쓴다 — 서명도 공증도 없으므로 받는 사람이
 Gatekeeper에서 **우클릭 → 열기**를 한 번 해야 하고, 업데이트마다 키체인 허용을 다시 묻는다.
 
-Windows: `windows-package.yml`이 `release: published`에서 깨어나 NSIS 설치 프로그램을 만들고,
-설치·`doctor`·제거까지 스스로 확인한 뒤 같은 `v*` 릴리스에 `Provider-Monitor-Setup.exe`를
-첨부한다. 그러니 맥에서 릴리스를 먼저 만들면 윈도우 파일은 알아서 붙는다:
+Windows 설치 파일은 현재 자동 첨부되지 않는다. Windows 호스트에서 네이티브 테스트와
+NSIS 빌드를 완료한 뒤 검증한 `Provider-Monitor-Setup.exe`를 같은 릴리스에 명시적으로 첨부해야 한다.
+설치된 버전과 실행 파일 경로·해시, 사용자 데스크톱 세션, 새 측정값을 함께 확인한다.
+아래 게시 명령은 사용자가 커밋·태그·게시를 요청한 경우에만 실행한다:
 
 ```bash
 VERSION=1.17.1
@@ -113,4 +113,7 @@ gh release create "v${VERSION}" "build/ci/ProviderMonitor-${VERSION}-unsigned.dm
 gh release view "v${VERSION}" --json assets -q '.assets[].name'   # dmg + Setup.exe 둘 다 확인
 ```
 
-`workflow_dispatch`로 단독 실행하면 컴파일·설치·`doctor`·제거만 확인하고 첨부하지 않는다.
+2026-11-17 확인한 원본은 `8405178`(정식 릴리스 1.25.0)이다. 우선 주간-only Claude,
+AGY 가족 선택, OpenCode 저장 형식 등의 수정 원리를 선별 적용한다. 우리의 계정별 측정 시각·
+마지막 정상값·등록 방식과 Windows 포트를 보존하며, 비용 인덱서나 계정 스위치 등 별도 기능을
+안정화 패치와 함께 가져오지 않는다.

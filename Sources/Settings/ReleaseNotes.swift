@@ -32,6 +32,18 @@ enum ReleaseNotes {
     static var all: [ReleaseNote] {
         [
             ReleaseNote(
+                version: "1.18.4",
+                headline: L10n.t("More reliable account readings with less background work."),
+                changes: [
+                    .init(title: L10n.t("Accurate quota readings"),
+                          detail: L10n.t("Weekly-only Claude plans, model-specific Antigravity limits, and current OpenCode logins are handled without substituting another account or model.")),
+                    .init(title: L10n.t("Less repeated work"),
+                          detail: L10n.t("Account monitoring stops replaced sources, bounds CLI work, and avoids scanning old LM Studio log folders on every poll.")),
+                    .init(title: L10n.t("Safer updates"),
+                          detail: L10n.t("Updates choose the matching installer and use isolated staging so interrupted work does not overwrite another installation."))
+                ]
+            ),
+            ReleaseNote(
                 version: "1.18.3",
                 headline: L10n.t("Clearer quota periods and automatic session recovery."),
                 changes: [
