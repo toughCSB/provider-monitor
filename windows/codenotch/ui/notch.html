@@ -67,6 +67,9 @@
   .limit-badge.lim-weekly{border-color:#4EA1FF;color:#8ec4ff}
   .limit-badge.lim-monthly{border-color:#B47CFF;color:#d3b3ff}
   .limit-badge.lim-5h{border-color:#FF9F45;color:#ffc389}
+  .account-badge{position:absolute;right:-4px;bottom:-3px;min-width:14px;height:14px;padding:0 2px;
+    border-radius:7px;background:#141414;border:1px solid #777;color:#fff;font-size:9px;font-weight:700;
+    line-height:12px;text-align:center;pointer-events:none}
   .glyph{
     position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     font-size:var(--glyph-size);font-weight:700;color:#e8e8ea;letter-spacing:-.5px;
@@ -251,6 +254,7 @@ function usedCopy(w){
 
 let usage={status:'',windows:[],fetched_at:0,note:''};
 let codexSnap={status:'absent',windows:[],fetched_at:0,note:''};
+let secondAccounts={}; // profile id -> {provider,snapshot}; only real distinct credentials enter here
 let cursorSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let agSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let grokSnap={status:'absent',windows:[],fetched_at:0,note:''};
@@ -376,8 +380,14 @@ const UK_TEXT={
 const TEXT_DICTS={ru:RU_TEXT,ko:KO_TEXT,zh:ZH_TEXT,ja:JA_TEXT,uk:UK_TEXT};
 function textCopy(value){
   if(!value) return '';
+  if(uiLang==='ko' && value==='Grok sign-in expired — automatic renewal pending') return 'Grok 인증 자동 갱신을 기다리고 있습니다.';
+  if(uiLang==='ko' && value==='Claude credential expired — automatic renewal pending') return 'Claude 인증 자동 갱신을 기다리고 있습니다.';
   const dict=TEXT_DICTS[uiLang];
   if(dict&&dict[value]) return dict[value];
+  if(uiLang==='ko') return String(value)
+    .replace(/^(\d+)m limit$/,'$1분 한도')
+    .replace(/^(\d+)h limit$/,'$1시간 한도')
+    .replace(/^(\d+)d limit$/,'$1일 한도');
   if(uiLang!=='ru') return value;
   return String(value)
     .replace(/^(\d+)m limit$/,'Лимит на $1 мин')
@@ -429,6 +439,7 @@ function setUiLanguage(lang){
 let scalePct=100, scaleDragging=false, scaleT=null, scaleSaveT=null;
 // "Is it working?" per provider: Claude from the four-state engine, the others from the activity probe. Returns running | attention | idle
 function workState(id){
+  if(id.startsWith('claude-')||id.startsWith('codex-')) return 'idle'; // no account-bound activity source yet
   if(id==='claude'){
     if(stateSnap.agg==='running') return 'running';
     if(stateSnap.agg==='attention') return 'attention';
@@ -468,21 +479,31 @@ function uniqueSvgIds(svgText,tag){
   return out;
 }
 function glyphHtml(p,small){
-  const g=glyphs[p.id];
+  const second=p.id.startsWith('codex-')||p.id.startsWith('claude-');
+  const alternate=p.badge==='2';
+  const g=glyphs[second?p.base:p.id];
   if(g&&g.kind==='svg'&&g.svg){
-    const tint=BRAND_TINT[p.id];
-    const svg=uniqueSvgIds(g.svg,p.id+(small?'c':'p'));
+    const tint=p.base==='codex'&&alternate?'#58C5AB':p.base==='claude'&&alternate?'#E9A080':BRAND_TINT[p.base||p.id];
+    const source=p.base==='claude'&&alternate?g.svg.replace(/#D97757/gi,'#E9A080'):g.svg;
+    const svg=uniqueSvgIds(source,p.id+(small?'c':'p'));
     return `<span class="mark"${tint?` style="color:${tint}"`:''}>${svg}</span>`;
   }
-  if(g&&g.url) return `<img class="${g.kind}" src="${g.url}" alt="${p.name}"${small?' style="width:16px;height:16px;border-radius:4px"':''}>`;
+  if(g&&g.url) return `<img class="${g.kind}" src="${g.url}" alt="${esc(p.name)}"${small?' style="width:16px;height:16px;border-radius:4px"':''}>`;
   return small?'':p.glyph; // fallback letter
 }
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
 // Which providers get a ring, and in what order: [{provider}]. null or an empty list means every provider.
 let notchSlots=null;
 function providers(){
-  const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
-  if(codexSnap.status!=='absent') list.push({id:'codex',name:'Codex',glyph:'Cx',snap:codexSnap});
+  const accounts=Object.entries(secondAccounts);
+  const managed=provider=>accounts.filter(([id,a])=>a.provider===provider&&id.startsWith(provider+'-managed-')).sort(([a],[b])=>a.localeCompare(b));
+  const legacy=provider=>accounts.find(([id,a])=>a.provider===provider&&!id.startsWith(provider+'-managed-'));
+  const list=[];
+  const claudeManaged=managed('claude'), codexManaged=managed('codex');
+  if(claudeManaged.length) for(const [id,a] of claudeManaged){if(a.disconnected)continue;const slot=Number(id.slice(-1));list.push({id,base:'claude',name:a.label||'Claude '+slot,glyph:'C',snap:a.snapshot,badge:String(slot)});}
+  else {const claude2=legacy('claude');list.push({id:'claude',base:'claude',name:claude2?'Claude 1':'Claude',glyph:'C',snap:usage,badge:claude2?'1':''});if(claude2)list.push({id:claude2[0],base:'claude',name:'Claude 2',glyph:'C',snap:claude2[1].snapshot,badge:'2'});}
+  if(codexManaged.length) for(const [id,a] of codexManaged){if(a.disconnected)continue;const slot=Number(id.slice(-1));list.push({id,base:'codex',name:a.label||'Codex '+slot,glyph:'Cx',snap:a.snapshot,badge:String(slot)});}
+  else {const codex2=legacy('codex');if(codexSnap.status!=='absent')list.push({id:'codex',base:'codex',name:codex2?'Codex 1':'Codex',glyph:'Cx',snap:codexSnap,badge:codex2?'1':''});if(codex2)list.push({id:codex2[0],base:'codex',name:'Codex 2',glyph:'Cx',snap:codex2[1].snapshot,badge:'2'});}
   if(cursorSnap.status!=='absent') list.push({id:'cursor',name:'Cursor',glyph:'Cu',snap:cursorSnap});
   if(agSnap.status!=='absent') list.push({id:'gemini',name:'Antigravity',glyph:'Ag',snap:agSnap});
   if(grokSnap.status!=='absent') list.push({id:'grok',name:'Grok',glyph:'Gk',snap:grokSnap});
@@ -550,6 +571,7 @@ function windowLike(ws,kind){ return ws.find(w=>laneIs(w,kind))||null; }
 // matches, falling back to the default when it has none.
 function headlineOf(snap,id){
   const ws=snap.windows; if(!ws.length) return null;
+  const base=id.startsWith('claude-')?'claude':id.startsWith('codex-')?'codex':id;
   const byId=x=>ws.find(w=>w.id===x)||null;
   const lim=limitFor(id);
   if(id!=='gemini' && lim!=='automatic'){
@@ -558,8 +580,8 @@ function headlineOf(snap,id){
   }
   // Weekly by default: the ring reads the window that decides whether the plan survives the
   // week, not the fast-moving session window (still shown in full on the hover card).
-  if(id==='claude') return byId('weekly_all')||byId('seven_day')||byId('weekly_scoped')||byId('weekly_opus')||byId('session');
-  if(id==='codex') return byId('secondary')||ws[0];
+  if(base==='claude') return byId('weekly_all')||byId('seven_day')||byId('weekly_scoped')||byId('weekly_opus')||byId('session');
+  if(base==='codex') return byId('secondary')||ws[0];
   if(id==='cursor') return byId('included')||byId('api'); // no weekly window: Cursor resets on its billing cycle instead
   if(id==='grok') return byId('credits'); // Grok Build is already the weekly pool
   if(id==='opencode') return byId('weekly')||byId('rolling');
@@ -581,10 +603,10 @@ function svgArc(r,frac,color,width,extra=''){
 function renderRing(){
   const ps=providers();
   // Rebuild the DOM only when the structure changes (never swap the element under the cursor)
-  const want=ps.map(p=>p.id+':'+(glyphs[p.id]?glyphs[p.id].kind:'-')).join(',');
+  const want=ps.map(p=>p.id+':'+p.name+':'+(glyphs[p.base||p.id]?glyphs[p.base||p.id].kind:'-')).join(',');
   if(pill.dataset.cells!==want){
     pill.innerHTML=ps.map(p=>`<div class="cell" data-p="${p.id}">
-      <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"></svg><div class="glyph ${(!glyphs[p.id]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div><span class="limit-badge"></span></div>
+      <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"></svg><div class="glyph ${(!glyphs[p.base||p.id]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div><span class="limit-badge"></span>${p.badge?`<span class="account-badge">${p.badge}</span>`:''}</div>
       <div class="pct">—</div></div>`).join('');
     pill.dataset.cells=want;
   }
@@ -696,10 +718,11 @@ let hoverId='claude';
 function renderCard(){
   const c=document.getElementById('card');
   const p=providers().find(x=>x.id===hoverId)||providers()[0];
+  if(!p){c.classList.remove('show');return;}
   const snap=p.snap;
   const headIcon=glyphHtml(p,true);
   const title=uiLang==='ru'?'Использование '+p.name:uiLang==='ko'?`${p.name} ${textCopy('Usage')}`:`${p.name} Usage`;
-  let html=`<div class="c-head">${headIcon}<span class="c-title">${title}</span></div>`;
+  let html=`<div class="c-head">${headIcon}<span class="c-title">${esc(title)}</span></div>`;
   if(snap.windows.length){
     // The two resets people actually watch lead directly under the header. Antigravity has one
     // 5-hour lane per model family, so resolve that lane in the same selected family as the ring.
@@ -1104,6 +1127,7 @@ listen('state',e=>{stateSnap=e.payload||stateSnap;setUiLanguage(stateSnap.lang_r
   .catch(e=>notice('listen(state) failed: '+e));
 listen('notice',e=>notice(e.payload)).catch(()=>{});
 listen('codex',e=>{codexSnap=e.payload||codexSnap;renderRing();finishRefreshFeedback('codex');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('account2',e=>{const a=e.payload;if(!a||!a.id)return;invoke('get_second_accounts').then(rows=>{if(!Array.isArray(rows))return;secondAccounts=Object.fromEntries(rows.map(row=>[row.id,row]));renderRing();finishRefreshFeedback(a.id);if(card.classList.contains('show'))renderCard();}).catch(()=>{});}).catch(()=>{});
 listen('cursor',e=>{cursorSnap=e.payload||cursorSnap;renderRing();finishRefreshFeedback('cursor');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_cursor').then(u=>{cursorSnap=u||cursorSnap;renderRing();}).catch(()=>{});
 listen('antigravity',e=>{agSnap=e.payload||agSnap;renderRing();finishRefreshFeedback('gemini');if(card.classList.contains('show'))renderCard();}).catch(()=>{});
@@ -1145,6 +1169,7 @@ listen('activity',e=>{activity=e.payload||activity;renderRing();if(card.classLis
 invoke('get_activity').then(a=>{activity=a||activity;renderRing();}).catch(()=>{});
 invoke('get_glyphs').then(g=>{glyphs=g||glyphs;renderRing();}).catch(()=>{});
 invoke('get_codex').then(u=>{codexSnap=u||codexSnap;renderRing();}).catch(()=>{});
+invoke('get_second_accounts').then(rows=>{if(Array.isArray(rows)){secondAccounts=Object.fromEntries(rows.map(a=>[a.id,a]));renderRing();}}).catch(()=>{});
 invoke('get_usage').then(u=>{usage=u||usage;renderRing();}).catch(e=>notice('get_usage failed: '+e));
 invoke('get_state').then(s=>{stateSnap=s||stateSnap;setUiLanguage(stateSnap.lang_resolved);renderRing();}).catch(()=>{});
 invoke('get_always_on_top').then(v=>{if(typeof v==='boolean')alwaysOnTop=v;}).catch(()=>{});

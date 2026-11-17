@@ -81,12 +81,34 @@ fn persist(s: &UsageSnapshot) {
 
 // ---------------- Locating the executable ----------------
 
+fn npm_native_executable(package: &Path) -> Option<PathBuf> {
+    let (platform_package, target) = match std::env::consts::ARCH {
+        "x86_64" => ("codex-win32-x64", "x86_64-pc-windows-msvc"),
+        "aarch64" => ("codex-win32-arm64", "aarch64-pc-windows-msvc"),
+        _ => return None,
+    };
+    let nested = package.join("node_modules").join("@openai").join(platform_package);
+    let hoisted = package.with_file_name(platform_package);
+
+    // Match npm resolution before falling back to the main package's bundled binary.
+    [nested.as_path(), hoisted.as_path(), package]
+        .iter()
+        .flat_map(|root| {
+            let vendor = root.join("vendor").join(target);
+            [vendor.join("bin").join("codex.exe"), vendor.join("codex").join("codex.exe")]
+        })
+        .find(|path| path.is_file())
+}
+
 /// Candidates in order: the native exe inside the global npm package (cleanest — no cmd/node
 /// wrapper) → ~/.codex/bin → codex.exe / codex.cmd on PATH.
 pub fn find_executable() -> Option<PathBuf> {
     let mut cands: Vec<PathBuf> = Vec::new();
     if let Some(appdata) = dirs::config_dir() {
         let pkg = appdata.join("npm").join("node_modules").join("@openai").join("codex");
+        if let Some(exe) = npm_native_executable(&pkg) {
+            return Some(exe);
+        }
         if let Ok(rd) = std::fs::read_dir(pkg.join("bin")) {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().to_lowercase();
@@ -125,13 +147,13 @@ fn auth_path() -> Option<PathBuf> {
     codex_home().map(|h| h.join("auth.json"))
 }
 
-struct Credential {
-    access_token: String,
-    account_id: String,
+pub(crate) struct Credential {
+    pub(crate) access_token: String,
+    pub(crate) account_id: String,
     /// chatgpt_plan_type from the id_token (pro / plus / free…), used only as a label
     plan: Option<String>,
     /// The access_token's exp has passed: the request is still sent (the server decides); this only changes the 401 wording
-    expired: bool,
+    pub(crate) expired: bool,
 }
 
 /// Second JWT segment (base64url) → claims. Used only for labels and a local expiry hint; nothing is verified here — that is the server's job
@@ -143,7 +165,11 @@ fn jwt_claims(token: &str) -> Option<serde_json::Value> {
 
 /// Reads Codex's sign-in state; a missing file or missing field both mean "not signed in"
 fn load_credential() -> Option<Credential> {
-    let text = std::fs::read_to_string(auth_path()?).ok()?;
+    load_credential_in(&codex_home()?)
+}
+
+pub(crate) fn load_credential_in(dir: &Path) -> Option<Credential> {
+    let text = std::fs::read_to_string(dir.join("auth.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     let tokens = v.get("tokens")?;
     let access_token = tokens.get("access_token")?.as_str()?.trim().to_string();
@@ -201,7 +227,7 @@ fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
 }
 
 /// Upstream's label rule: Codex names windows only by length, and "5h limit" says more than "primary"
-fn label_for(window_minutes: Option<f64>, id: &str) -> String {
+pub(crate) fn label_for(window_minutes: Option<f64>, id: &str) -> String {
     match window_minutes {
         Some(m) if m > 0.0 => {
             if m < 60.0 {
@@ -322,7 +348,7 @@ fn push_unique(out: &mut Vec<LimitWindow>, window: LimitWindow) {
 /// came from and the label is derived from the length — the primary window is
 /// not always five hours (a free plan has shown 30 days), and recognising only
 /// fixed lengths would drop a window that is genuinely in use.
-fn windows_from_usage(v: &serde_json::Value) -> Vec<LimitWindow> {
+pub(crate) fn windows_from_usage(v: &serde_json::Value) -> Vec<LimitWindow> {
     let now = now_ms();
     let mut out = Vec::new();
     for (id, key) in [("primary", "primary_window"), ("secondary", "secondary_window")] {
@@ -672,6 +698,31 @@ pub fn probe() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(all(windows, any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn npm_resolves_the_native_platform_binary_before_the_cmd_wrapper() {
+        let root = std::env::temp_dir().join(format!("provider-codex-npm-test-{}", std::process::id()));
+        let package = root.join("@openai").join("codex");
+        let (name, target) = if cfg!(target_arch = "aarch64") {
+            ("codex-win32-arm64", "aarch64-pc-windows-msvc")
+        } else {
+            ("codex-win32-x64", "x86_64-pc-windows-msvc")
+        };
+        let native = PathBuf::from("vendor").join(target).join("bin").join("codex.exe");
+        let hoisted = package.with_file_name(name).join(&native);
+        let nested = package.join("node_modules").join("@openai").join(name).join(native);
+        let wrapper = root.join("codex.cmd");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(hoisted.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, []).unwrap();
+        assert_eq!(npm_native_executable(&package), None);
+        std::fs::write(&hoisted, []).unwrap();
+        assert_eq!(npm_native_executable(&package), Some(hoisted));
+        std::fs::write(&nested, []).unwrap();
+        assert_eq!(npm_native_executable(&package), Some(nested));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn account_bound_last_good_is_retained_only_for_the_same_identity() {

@@ -153,11 +153,17 @@ fn should_renew(expires_at: Option<u64>, now: u64) -> bool {
 }
 
 fn run_renewal(cli: &Path) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
+    run_renewal_with_timeout(cli, Duration::from_secs(RENEW_TIMEOUT_SECS))
+}
 
-    let mut cmd = Command::new(cli);
+fn run_renewal_with_timeout(cli: &Path, timeout: Duration) -> std::io::Result<()> {
+    use std::process::Stdio;
+
+    let mut cmd = crate::polling::cli_command(cli);
     cmd.args(["agent", "--reauth", "stdio"])
-        .stdin(Stdio::null())
+        // Keep the empty pipe open: EOF can end stdio before reauthentication.
+        // No prompts or RPC requests are sent; the timeout reaps only this child.
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env_remove("GROK_HOME")
@@ -169,16 +175,7 @@ fn run_renewal(cli: &Path) -> std::io::Result<()> {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     let mut child = cmd.spawn()?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(RENEW_TIMEOUT_SECS);
-    while child.try_wait()?.is_none() {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
+    crate::polling::wait_for_renewal(&mut child,timeout)
 }
 
 #[derive(Default)]
@@ -362,13 +359,13 @@ where
     };
     if cred.expires_at.map(|e| e <= now).unwrap_or(false) {
         if renew(&cred) != Some(true) {
-            return auth_failure(snap, "Grok sign-in expired — run grok login again");
+            return auth_failure(snap, "Grok sign-in expired — automatic renewal pending");
         }
         let Some(renewed) = load() else {
-            return auth_failure(snap, "Grok sign-in expired — run grok login again");
+            return auth_failure(snap, "Grok sign-in expired — automatic renewal pending");
         };
         if renewed.expires_at.map(|e| e <= now_ms()).unwrap_or(false) {
-            return auth_failure(snap, "Grok sign-in expired — run grok login again");
+            return auth_failure(snap, "Grok sign-in expired — automatic renewal pending");
         }
         cred = renewed;
     }
@@ -469,6 +466,19 @@ pub fn start(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn renewal_keeps_stdio_open_and_bounds_the_owned_command_tree() {
+        let dir=std::env::temp_dir().join(format!("grok-stdin-test-{}-{}",std::process::id(),now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker=dir.join("received-eof.txt");
+        let cli=dir.join("grok.cmd");
+        std::fs::write(&cli,format!("@echo off\r\nset /p pm_line=\r\n> \"{}\" echo EOF\r\n",marker.display())).unwrap();
+        run_renewal_with_timeout(&cli,Duration::from_millis(1200)).unwrap();
+        assert!(!marker.exists(),"EOF must not stop the CLI before token renewal starts");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn windows(json: &str) -> Vec<LimitWindow> {
         windows_from_credits(&serde_json::from_str(json).unwrap())

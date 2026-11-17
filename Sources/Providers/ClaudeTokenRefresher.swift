@@ -60,6 +60,7 @@ final class ClaudeTokenRefresher: ObservableObject {
     private let interval: TimeInterval
 
     private let cli: URL?
+    private let locateCLI: () -> URL?
     private let launcher: Launcher
     /// The token's expiry as the usage provider last read it. Cheap: it is the
     /// value already in hand, so asking costs no keychain traffic and no prompt.
@@ -79,7 +80,8 @@ final class ClaudeTokenRefresher: ObservableObject {
     init(
         expiry: @escaping @MainActor () async -> Date?,
         reload: @escaping @MainActor () async -> Date?,
-        cli: URL? = ClaudeCLI.standalone(),
+        cli: URL?,
+        locateCLI: @escaping () -> URL? = { nil },
         profile: ClaudeProfile = .default(),
         margin: TimeInterval = 4 * 60,
         cooldown: TimeInterval = 10 * 60,
@@ -90,6 +92,7 @@ final class ClaudeTokenRefresher: ObservableObject {
         self.expiry = expiry
         self.reload = reload
         self.cli = cli
+        self.locateCLI = locateCLI
         self.margin = margin
         self.cooldown = cooldown
         self.timeout = timeout
@@ -99,6 +102,24 @@ final class ClaudeTokenRefresher: ObservableObject {
         self.launcher = launcher ?? { cli, timeout in
             try ClaudeTokenRefresher.run(cli, timeout: timeout, profile: profile)
         }
+    }
+
+    /// Production re-discovers the official CLI after installation without
+    /// disturbing tests that explicitly inject a fixed (including nil) CLI.
+    convenience init(
+        expiry: @escaping @MainActor () async -> Date?,
+        reload: @escaping @MainActor () async -> Date?,
+        profile: ClaudeProfile = .default(),
+        margin: TimeInterval = 4 * 60,
+        cooldown: TimeInterval = 10 * 60,
+        timeout: TimeInterval = 30,
+        interval: TimeInterval = 60,
+        launcher: Launcher? = nil
+    ) {
+        self.init(expiry: expiry, reload: reload, cli: nil,
+                  locateCLI: { ClaudeCLI.standalone() }, profile: profile,
+                  margin: margin, cooldown: cooldown, timeout: timeout,
+                  interval: interval, launcher: launcher)
     }
 
     func start() {
@@ -141,12 +162,12 @@ final class ClaudeTokenRefresher: ObservableObject {
         else { return }
 
         let remaining = current.timeIntervalSince(now)
-        guard let cli else {
-            // This instance cannot acquire a CLI later; repeating the warning
-            // on every tick would achieve nothing.
-            renewalPolicy.finishForCurrentExpiry()
-            fail("Claude's saved login is about to expire and the `claude` command "
-               + "isn't installed to renew it. Run Claude Code once to sign in again.")
+        guard let cli = cli ?? locateCLI() else {
+            // The CLI may be installed later while this monitor stays running.
+            // Recheck in an hour without launching or warning on every tick.
+            renewalPolicy.deferUnavailable(at: now)
+            fail("Claude's saved login needs renewal and the official CLI isn't installed. "
+               + "Automatic renewal will retry when the CLI is available.")
             return
         }
         renewalPolicy.recordAttempt(at: now)

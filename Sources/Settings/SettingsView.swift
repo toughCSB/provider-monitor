@@ -151,6 +151,7 @@ struct SettingsView: View {
     /// another app, so the user is always coming *back* here to see it — which
     /// makes returning focus the exact moment the old value is wrong.
     @State private var accounts: [ProviderSummary] = []
+    @State private var accountRegistrationError: String?
     @State private var displays: [DisplayOption] = []
     @State private var selection: SettingsSection = .accounts
     /// The provider being dragged right now.
@@ -495,8 +496,48 @@ struct SettingsView: View {
         }
     }
 
+    private func chooseAccountFolder(_ family: MonitoredAccounts.Family) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = URL(fileURLWithPath: NSHomeDirectory())
+        panel.message = L10n.t("Choose the folder used by your second \(family.name) account.")
+        panel.prompt = L10n.t("Add account")
+        guard panel.runModal() == .OK, let directory = panel.url, let usageStore else { return }
+        do {
+            try usageStore.addAccount(family, directory: directory)
+            accountRegistrationError = nil
+            accounts = providers()
+        } catch {
+            accountRegistrationError = error.localizedDescription
+        }
+    }
+
     private var accountsPane: some View {
         Form {
+            if let controller = usageStore?.managedAccounts {
+                ManagedAccountsSection(controller: controller)
+            }
+            Section(L10n.t("Multiple accounts")) {
+                DisclosureGroup(L10n.t("Advanced: connect an existing login folder")) {
+                Text(L10n.t("Two ChatGPT accounts saved in Aside are connected automatically when Provider Monitor starts."))
+                    .font(.caption).foregroundStyle(.secondary)
+                Text(L10n.t("Monitor up to two Codex and two Claude accounts. Choose the folder used by a different signed-in account; each account keeps its own usage and connection status."))
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    ForEach(MonitoredAccounts.Family.allCases, id: \.rawValue) { family in
+                        Button(L10n.t("Connect \(family.name) folder…")) { chooseAccountFolder(family) }
+                            .disabled(usageStore == nil || accounts.filter { family.contains($0.id) }.count >= 2
+                                      || !(usageStore?.managedAccounts?.accounts(for: family).isEmpty ?? true))
+                    }
+                }
+                if let accountRegistrationError {
+                    Text(accountRegistrationError).font(.caption).foregroundStyle(.red)
+                }
+                }
+            }
             // Split in two, because ordering only means anything for the
             // first group: a provider switched off has no ring in the notch,
             // so dragging it was arranging something that is not on screen.
@@ -1426,7 +1467,7 @@ private struct AccountRow: View {
                 HStack(spacing: 10) {
                     if isOrderable { handle }
 
-                    ProviderGlyphView(glyph: provider.glyph, size: 16)
+                    ProviderGlyphView(glyph: provider.glyph, size: 16, accountNumber: provider.accountNumber)
                         .foregroundStyle(isConnected ? .primary : .tertiary)
 
                     Text(provider.name)

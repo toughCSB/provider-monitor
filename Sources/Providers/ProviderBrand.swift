@@ -27,7 +27,12 @@ enum ProviderBrand {
 
     /// The colour this glyph is drawn in, or `nil` to leave it in the app's own
     /// text colour — which is what every call site already sets.
-    static func markColor(_ glyph: ProviderGlyph) -> Color? {
+    static func markColor(_ glyph: ProviderGlyph, accountNumber: Int? = nil) -> Color? {
+        // Account accents, not alternative vendor branding. Quota risk colours stay unchanged.
+        if accountNumber == 2 {
+            if glyph == .openai { return Color(hex: 0x58C5AB) }
+            if glyph == .claude { return Color(hex: 0xE9A080) }
+        }
         switch glyph {
         // The vendor publishes this colour for the mark itself.
         case .claude:      return Color(hex: 0xD97757)   // Anthropic

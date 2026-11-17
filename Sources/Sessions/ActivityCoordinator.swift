@@ -5,7 +5,13 @@ import Foundation
 /// sessions nor keep usage refreshes in the fast, busy cadence.
 @MainActor
 final class ActivityCoordinator {
-    private let monitors: [String: any AgentActivityMonitor]
+    private var monitors: [String: any AgentActivityMonitor]
+    var knownIDs: Set<String> { Set(monitors.keys) }
+
+    func add(_ monitor: any AgentActivityMonitor, for id: String) {
+        guard monitors[id] == nil else { return }
+        monitors[id] = monitor
+    }
     private let onSessions: (String, [AgentSession]) -> Void
     private var subscriptions: [String: AnyCancellable] = [:]
     private(set) var activeIDs: Set<String> = []

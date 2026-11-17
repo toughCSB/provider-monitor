@@ -121,6 +121,7 @@ struct GlyphShape: Shape {
 struct ProviderGlyphView: View {
     let glyph: ProviderGlyph
     var size: CGFloat = Design.px(46)
+    var accountNumber: Int? = nil
 
     var body: some View {
         if let colour = brandColour {
@@ -135,7 +136,7 @@ struct ProviderGlyphView: View {
     /// worth inventing (OpenCode, Ollama). `nil` leaves the caller's colour in
     /// charge, which is the app's text colour everywhere it is drawn today.
     private var brandColour: Color? {
-        ProviderBrand.isFullColourMark(glyph) ? nil : ProviderBrand.markColor(glyph)
+        ProviderBrand.isFullColourMark(glyph) ? nil : ProviderBrand.markColor(glyph, accountNumber: accountNumber)
     }
 
     private var mark: some View {

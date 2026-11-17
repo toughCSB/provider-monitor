@@ -112,6 +112,7 @@ extension UsageProvider {
 
 /// A provider as the settings sheet needs it.
 struct ProviderSummary: Identifiable, Equatable {
+    var accountNumber: Int? = nil
     var kind: ProviderKind = .usage
     var localModel: LocalRuntimeReading.Model? = nil
     var sourceProviderID: String? = nil

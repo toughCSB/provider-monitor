@@ -91,6 +91,28 @@ fn sanitize_terminal_output(input: &str) -> String {
     out
 }
 
+fn parse_reset_time(text: &str) -> Option<u64> {
+    use chrono::TimeZone;
+    let text = text.trim();
+    if let Ok(date) = chrono::DateTime::parse_from_rfc3339(text) {
+        return u64::try_from(date.timestamp_millis()).ok().filter(|time| *time > 0);
+    }
+    // Current Windows CLI output: `2026-11-21 17:24 KST`. An unknown or unavailable
+    // reset must not discard an otherwise valid, current quota percentage.
+    let (stamp, zone) = text.rsplit_once(char::is_whitespace)?;
+    let offset = match zone.trim() {
+        "KST" => 9 * 3600,
+        "UTC" | "GMT" => 0,
+        _ => return None,
+    };
+    let stamp = stamp.trim();
+    let local = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S"))
+        .ok()?;
+    let zone = chrono::FixedOffset::east_opt(offset)?;
+    u64::try_from(zone.from_local_datetime(&local).single()?.timestamp_millis()).ok().filter(|time| *time > 0)
+}
+
 /// Parses official Antigravity CLI quota output into `LimitWindow` items.
 /// Converts remaining percentage to fraction used (used = 1.0 - remaining / 100).
 /// Returns an error on invalid or unrecognized format; never returns dummy 0% quotas.
@@ -112,12 +134,7 @@ fn parse_quota(text: &str) -> Result<Vec<LimitWindow>, String> {
         if !remaining.is_finite() || !(0.0..=100.0).contains(&remaining) {
             return Err("Quota percentage is out of range".into());
         }
-        let reset = chrono::DateTime::parse_from_rfc3339(reset.trim())
-            .map_err(|_| "Invalid quota reset time")?
-            .timestamp_millis();
-        if reset <= 0 {
-            return Err("Invalid quota reset time".into());
-        }
+        let reset = parse_reset_time(reset);
         let label = label.split_whitespace().collect::<Vec<_>>().join(" ");
         let label = label
             .strip_suffix(" Remaining")
@@ -140,7 +157,7 @@ fn parse_quota(text: &str) -> Result<Vec<LimitWindow>, String> {
             group,
             id: label,
             used: ((100.0 - remaining) / 100.0).clamp(0.0, 1.0),
-            resets_at: Some(reset as u64),
+            resets_at: reset,
             ..Default::default()
         });
     }
@@ -558,9 +575,29 @@ mod tests {
             &text.replace("94%", "101%"),
             &text.replace("94%", "-5%"),
             &text.replace("94%", "NaN%"),
-            &text.replace("2026-09-12T01:47:23Z", "not-a-date"),
         ] {
             assert!(parse_quota(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn test_parse_quota_live_kst_and_unavailable_reset() {
+        // Captured from the signed-in SV desktop CLI on 2026-11-17. Only quota rows are retained.
+        let report = "Quota:\nGemini Models          Weekly Limit Remaining       93%   2026-11-21 17:24 KST\nGemini Models          Five Hour Limit Remaining    100%  2026-11-17 06:10 KST\nClaude and GPT models  Weekly Limit Remaining       100%  2026-11-24 01:10 KST\nClaude and GPT models  Five Hour Limit Remaining    100%  2026-11-17 06:10 KST";
+        let windows = parse_quota(report).expect("live CLI rows");
+        assert_eq!(windows.len(), 4);
+        let weekly = windows.iter().find(|w| w.id == "Gemini Models Weekly Limit").unwrap();
+        assert!((weekly.used - 0.07).abs() < 1e-5);
+        assert_eq!(weekly.resets_at, Some(chrono::DateTime::parse_from_rfc3339("2026-11-21T08:24:00Z").unwrap().timestamp_millis() as u64));
+
+        for unknown in ["", "N/A", "not-a-date"] {
+            let report = format!("Quota:\nGemini Models Weekly Limit Remaining 93% {unknown}");
+            let rows = parse_quota(&report).expect("valid percentage without a reset");
+            assert_eq!(rows[0].resets_at, None);
+            assert!((rows[0].used - 0.07).abs() < 1e-5);
+        }
+        for bad in ["NaN", "101", "-5"] {
+            assert!(parse_quota(&format!("Quota:\nGemini Models Weekly Limit Remaining {bad}% N/A")).is_err());
         }
     }
 

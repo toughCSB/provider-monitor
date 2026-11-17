@@ -68,6 +68,8 @@ fn handle(app: &AppHandle, id: &str) {
         "refresh" => {
             crate::usage::request_refresh();
             crate::codex::request_refresh();
+            crate::multi::request_refresh(crate::profiles::Kind::Claude);
+            crate::multi::request_refresh(crate::profiles::Kind::Codex);
             crate::cursor::request_refresh();
             crate::antigravity::request_refresh();
             let a = app.clone();

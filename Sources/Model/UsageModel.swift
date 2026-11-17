@@ -245,7 +245,7 @@ struct UsageBlock: Equatable {
 
 struct ProviderSnapshot: Identifiable, Equatable {
     let id: String
-    let displayName: String
+    var displayName: String
     let glyph: ProviderGlyph
     let fidelity: Fidelity
     var status: ProviderStatus
@@ -268,6 +268,7 @@ struct ProviderSnapshot: Identifiable, Equatable {
     /// windows: it is not a measurement, it is a door being shut.
     var block: UsageBlock?
     var kind: ProviderKind = .usage
+    var accountNumber: Int? = nil
     var localRuntime: LocalRuntimeReading?
     var localModel: LocalRuntimeReading.Model?
     var localPerformance: LocalModelPerformance?

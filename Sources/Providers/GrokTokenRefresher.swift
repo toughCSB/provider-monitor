@@ -10,11 +10,10 @@ import Foundation
 /// That is the hole this fills.
 ///
 /// **How it renews, and why that is a compatibility mechanism rather than an
-/// interface.** `grok agent --reauth stdio` with an empty stdin starts the CLI
-/// headlessly — which is where it refreshes the session — and then exits because
-/// no prompt ever arrives. Measured against a copy of the credential on a real
-/// machine: about three seconds, no output, no browser, no session file, and
-/// `expires_at` moved six hours forward.
+/// interface.** `grok agent --reauth stdio` starts the CLI headlessly, with
+/// stdin open but no prompt or request sent. EOF can stop newer CLIs before
+/// authentication runs. The bounded runner terminates its own idle process;
+/// the updated expiry, rather than an exit code, proves renewal succeeded.
 ///
 /// The gate is exact, and it is why this asks so late. A session with sixty
 /// seconds left is left alone; one that expired sixty seconds ago is renewed on
@@ -51,6 +50,7 @@ final class GrokTokenRefresher: ObservableObject {
     private let interval: TimeInterval
 
     private let cli: URL?
+    private let locateCLI: () -> URL?
     private let launcher: Launcher
     /// The session's expiry, read from disk. One small file, no keychain and no
     /// network: the freshest answer is also the cheapest, which is what lets the
@@ -67,7 +67,8 @@ final class GrokTokenRefresher: ObservableObject {
 
     init(
         expiry: @escaping @MainActor () async -> Date?,
-        cli: URL? = GrokCLI.standalone(),
+        cli: URL?,
+        locateCLI: @escaping () -> URL? = { nil },
         margin: TimeInterval = 0,
         cooldown: TimeInterval = 10 * 60,
         timeout: TimeInterval = 45,
@@ -76,11 +77,27 @@ final class GrokTokenRefresher: ObservableObject {
     ) {
         self.expiry = expiry
         self.cli = cli
+        self.locateCLI = locateCLI
         self.margin = margin
         self.cooldown = cooldown
         self.timeout = timeout
         self.interval = interval
         self.launcher = launcher
+    }
+
+    /// Production re-discovers the official CLI after installation; an
+    /// explicitly injected CLI remains fixed for deterministic tests.
+    convenience init(
+        expiry: @escaping @MainActor () async -> Date?,
+        margin: TimeInterval = 0,
+        cooldown: TimeInterval = 10 * 60,
+        timeout: TimeInterval = 45,
+        interval: TimeInterval = 60,
+        launcher: @escaping Launcher = GrokTokenRefresher.run
+    ) {
+        self.init(expiry: expiry, cli: nil, locateCLI: { GrokCLI.standalone() },
+                  margin: margin, cooldown: cooldown, timeout: timeout,
+                  interval: interval, launcher: launcher)
     }
 
     func start() {
@@ -115,8 +132,8 @@ final class GrokTokenRefresher: ObservableObject {
               let current
         else { return }
 
-        guard let cli else {
-            renewalPolicy.finishForCurrentExpiry()
+        guard let cli = cli ?? locateCLI() else {
+            renewalPolicy.deferUnavailable(at: now)
             fail("Grok's saved sign-in has expired and the `grok` command isn't "
                + "installed to renew it. Run `grok login` once to sign in again.")
             return
@@ -138,7 +155,7 @@ final class GrokTokenRefresher: ObservableObject {
         // Judged on the outcome, never on the exit status.
         let after = await expiry()
         guard let after, after > current else {
-            fail("Grok usage needs its sign-in renewed — run `grok login` once in a terminal.")
+            fail("Grok session renewal has not completed. Automatic renewal will retry.")
             Log.usage.error("grok token renewal ran (exit \(status ?? -1)) but the expiry did not move; still \(String(describing: after), privacy: .public)")
             return
         }
@@ -178,7 +195,9 @@ final class GrokTokenRefresher: ObservableObject {
             environment["PWD"] = scratch.path
         }
         process.environment = environment
-        process.standardInput = FileHandle.nullDevice
+        // Process retains this pipe, including the open writing end, until the
+        // bounded exit closure finishes. Do not signal EOF before authentication.
+        process.standardInput = Pipe()
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()

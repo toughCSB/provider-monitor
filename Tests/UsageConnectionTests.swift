@@ -60,6 +60,30 @@ final class UsageConnectionTests: XCTestCase {
         XCTAssertNil(archive.load()[provider.id])
     }
 
+    func testExplicitIdentityRejectionClearsHistoryEvenWithStableRegistrationID() async {
+        let provider = Provider()
+        let (store, archive) = setup(provider)
+        defer { store.stop() }
+        await store.refresh()
+        provider.error = .accountChanged
+        await store.refresh()
+        XCTAssertFalse(store.snapshots.first?.hasReading ?? true)
+        XCTAssertNil(archive.load()[provider.id])
+    }
+
+    func testReplacingFamilyDropsOldSourceAndRetainsOtherProvider() async {
+        let provider = Provider()
+        let (store, archive) = setup(provider)
+        defer { store.stop() }
+        await store.refresh()
+        store.replaceFamily(.codex, with: [])
+        XCTAssertTrue(store.snapshots.first?.hasReading ?? false)
+        store.replaceFamily(.claude, with: [])
+        XCTAssertTrue(store.knownIDs.isEmpty)
+        XCTAssertTrue(store.snapshots.isEmpty)
+        XCTAssertNil(archive.load()[provider.id])
+    }
+
     func testAccountSwitchDropsOldReadingEvenWhenTheNewRequestFailsTransiently() async {
         let provider = Provider()
         let (store, archive) = setup(provider)

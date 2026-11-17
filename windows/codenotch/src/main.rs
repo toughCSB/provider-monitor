@@ -12,6 +12,9 @@ mod tray;
 mod usage;
 mod polling;
 mod codex;
+mod profiles;
+mod multi;
+mod managed;
 mod cursor;
 mod antigravity;
 mod grok;
@@ -41,7 +44,7 @@ pub const NOTCH_W: f64 = 360.0;
 /// A simple 360×700 rotation clipped the bottom of cards because the card begins beyond the body.
 pub const HORIZONTAL_NOTCH_H: f64 = 700.0;
 /// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r43-grok-click-parity";
+pub const BUILD: &str = "r46-session-recovery-and-time-labels";
 // The macOS geometry is 526 pt tall for five provider cells before a hover card is considered.
 // 700 leaves the same end slack the native panel keeps, so the first/last card can stay wholly on
 // screen without shrinking the rings or folding the spacing back toward the old Windows design.
@@ -53,6 +56,7 @@ pub struct AppState {
     pub usage: Mutex<usage::UsageSnapshot>,
     /// Codex snapshot (same UsageSnapshot shape; status may also be none/absent)
     pub codex: Mutex<usage::UsageSnapshot>,
+    pub second: Mutex<std::collections::HashMap<String, usage::UsageSnapshot>>,
     pub cursor: Mutex<usage::UsageSnapshot>,
     pub antigravity: Mutex<usage::UsageSnapshot>,
     pub grok: Mutex<usage::UsageSnapshot>,
@@ -531,6 +535,9 @@ fn get_usage(state: tauri::State<AppState>) -> usage::UsageSnapshot {
 fn refresh_usage(app: AppHandle) {
     usage::request_refresh();
     codex::request_refresh();
+    multi::request_refresh(profiles::Kind::Claude);
+    multi::request_refresh(profiles::Kind::Codex);
+    for provider in ["claude", "codex"] { for slot in 1..=2 { managed::request_refresh(&format!("{provider}-managed-{slot}")); } }
     cursor::request_refresh();
     antigravity::request_refresh();
     grok::request_refresh();
@@ -597,6 +604,105 @@ fn get_codex(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.codex.lock().unwrap().clone()
 }
 
+#[derive(serde::Serialize)]
+struct SecondAccount { id: String, provider: String, snapshot: usage::UsageSnapshot, label: Option<String>, slot: Option<u8>, identity: Option<String>, disconnected: bool }
+
+#[tauri::command]
+fn get_second_accounts(app: AppHandle) -> Vec<SecondAccount> {
+    let mut rows: Vec<SecondAccount> = [profiles::Kind::Claude, profiles::Kind::Codex].into_iter().filter_map(|kind| {
+        if managed::has_provider(&app, kind.id()) { return None; }
+        let profile = multi::active(&app, kind)?;
+        let snapshot = app.state::<AppState>().second.lock().unwrap().get(&profile.id).cloned().unwrap_or_default();
+        Some(SecondAccount { id: profile.id, provider: kind.id().into(), snapshot, label: None, slot: None, identity: None, disconnected: false })
+    }).collect();
+    rows.extend(managed::views(&app).into_iter().map(|a| SecondAccount { id:a.id, provider:a.provider, snapshot:a.snapshot,
+        label:Some(a.label), slot:Some(a.slot), identity:Some(a.identity), disconnected:a.disconnected }));
+    rows
+}
+
+#[tauri::command]
+fn get_managed_accounts(app: AppHandle) -> Vec<managed::AccountView> { managed::views(&app) }
+
+#[tauri::command]
+fn begin_managed_login(app: AppHandle, provider: String, slot: u8) -> Result<managed::LoginState, String> { managed::start_login(&app, provider, slot) }
+
+#[tauri::command]
+fn get_managed_login_state(app: AppHandle, provider: String, slot: u8) -> Result<managed::LoginState, String> { managed::login_state(&app, provider, slot) }
+
+#[tauri::command]
+fn confirm_managed_login(app: AppHandle, provider: String, slot: u8, label: String) -> Result<(), String> { managed::confirm(&app, provider, slot, label) }
+
+#[tauri::command]
+fn cancel_managed_login(provider: String, slot: u8) -> Result<(), String> { managed::cancel(provider, slot) }
+
+#[tauri::command]
+fn set_managed_disconnected(app: AppHandle, provider: String, slot: u8, disconnected: bool) -> Result<(), String> { managed::disconnect(&app, provider, slot, disconnected) }
+
+#[tauri::command]
+fn remove_managed_account(app: AppHandle, provider: String, slot: u8) -> Result<(), String> { managed::remove(&app, provider, slot) }
+
+fn profile_kind(provider: &str) -> Option<profiles::Kind> {
+    match provider { "codex" => Some(profiles::Kind::Codex), "claude" => Some(profiles::Kind::Claude), _ => None }
+}
+
+#[tauri::command]
+fn get_second_profile(app: AppHandle, provider: String) -> Option<String> {
+    let kind = profile_kind(&provider)?;
+    let st = app.state::<AppState>();
+    let c = st.cfg.lock().unwrap();
+    if kind == profiles::Kind::Codex { c.codex_profile_2.clone() } else { c.claude_profile_2.clone() }
+}
+
+#[tauri::command]
+fn set_second_profile(app: AppHandle, provider: String, path: String) -> Result<(), String> {
+    let kind = profile_kind(&provider).ok_or("Unknown provider")?;
+    if managed::has_provider(&app, kind.id()) { return Err("Remove managed accounts before using legacy profile selection".into()); }
+    let chosen = if path.trim().is_empty() { None } else {
+        let canonical = profiles::validate_registration(kind, &path)?;
+        let dir = std::path::Path::new(&canonical);
+        let second_id = multi::identity(kind, dir);
+        let first_id = profiles::default_dir(kind).and_then(|dir| multi::identity(kind, &dir));
+        if kind == profiles::Kind::Claude && (second_id.is_none() || first_id.is_none()) {
+            return Err("Cannot verify a different Claude account; check .claude.json account details".into());
+        }
+        if second_id.is_some() && second_id == first_id { return Err("That credential is already account 1".into()); }
+        Some(canonical)
+    };
+    {
+        let st = app.state::<AppState>();
+        let mut c = st.cfg.lock().unwrap();
+        if kind == profiles::Kind::Codex { c.codex_profile_2 = chosen; c.codex_auto_profile_2 = None; c.codex_second_disconnected = false; }
+        else { c.claude_profile_2 = chosen; c.claude_auto_profile_2 = None; c.claude_second_disconnected = false; }
+        config::save(&c);
+    }
+    multi::request_refresh(kind);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_second_enabled(app: AppHandle, provider: String) -> Option<bool> {
+    let kind = profile_kind(&provider)?;
+    multi::selected(&app, kind)?;
+    let st = app.state::<AppState>();
+    let c = st.cfg.lock().unwrap();
+    Some(if kind == profiles::Kind::Codex { !c.codex_second_disconnected } else { !c.claude_second_disconnected })
+}
+
+#[tauri::command]
+fn set_second_enabled(app: AppHandle, provider: String, enabled: bool) -> Result<(), String> {
+    let kind = profile_kind(&provider).ok_or("Unknown provider")?;
+    if managed::has_provider(&app, kind.id()) { return Err("Managed accounts use their own connection controls".into()); }
+    {
+        let st = app.state::<AppState>();
+        let mut c = st.cfg.lock().unwrap();
+        if kind == profiles::Kind::Codex { c.codex_second_disconnected = !enabled; }
+        else { c.claude_second_disconnected = !enabled; }
+        config::save(&c);
+    }
+    multi::request_refresh(kind);
+    Ok(())
+}
+
 #[tauri::command]
 fn get_grok(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.grok.lock().unwrap().clone()
@@ -638,9 +744,15 @@ fn get_kiro(state: tauri::State<AppState>) -> usage::UsageSnapshot {
 }
 
 fn request_provider_refresh(app: &AppHandle, provider: &str) -> bool {
+    if managed::views(app).iter().any(|a| a.id == provider && !a.disconnected) {
+        managed::request_refresh(provider);
+        return true;
+    }
     match provider {
         "claude" => usage::request_refresh(),
         "codex" => codex::request_refresh(),
+        id if multi::active(app, profiles::Kind::Claude).is_some_and(|p| p.id == id) => multi::request_refresh(profiles::Kind::Claude),
+        id if multi::active(app, profiles::Kind::Codex).is_some_and(|p| p.id == id) => multi::request_refresh(profiles::Kind::Codex),
         "cursor" => cursor::request_refresh(),
         "gemini" => antigravity::request_refresh(),
         "grok" => grok::request_refresh(),
@@ -677,6 +789,7 @@ fn get_double_click_time_ms() -> u64 {
 fn provider_page(provider: &str) -> &'static str {
     match provider {
         "codex" => "https://chatgpt.com/codex/cloud/settings/analytics#usage",
+        id if id.starts_with("codex-") => "https://chatgpt.com/codex/cloud/settings/analytics#usage",
         "cursor" => "https://cursor.com/dashboard",
         "gemini" => "https://gemini.google.com/app",
         // Kept unchanged at 떡배님's request.
@@ -1123,7 +1236,12 @@ fn lane_is(w: &usage::LimitWindow, limit: &str) -> bool {
 
 /// Ids match the ones the page uses, so the tray, the settings window and the notch all agree.
 fn snapshot_of(app: &AppHandle, id: &str) -> usage::UsageSnapshot {
+    if id.contains("-managed-") {
+        return managed::views(app).into_iter().find(|a| a.id == id)
+            .map(|a| a.snapshot).unwrap_or_default();
+    }
     let st = app.state::<AppState>();
+    if let Some(snapshot) = st.second.lock().unwrap().get(id) { return snapshot.clone(); }
     match id {
         "codex" => st.codex.lock().unwrap().clone(),
         "cursor" => st.cursor.lock().unwrap().clone(),
@@ -1158,7 +1276,8 @@ fn ring_pct(app: &AppHandle, provider: &str) -> Option<u32> {
         let c = st.cfg.lock().unwrap();
         (ring_limit_for(&c, provider), c.antigravity_model.clone(), c.percent_basis.clone())
     };
-    ring_window(provider, &snap.windows, &limit, &model)
+    let base = if provider.starts_with("codex-") { "codex" } else if provider.starts_with("claude-") { "claude" } else { provider };
+    ring_window(base, &snap.windows, &limit, &model)
         .filter(|w| w.count.is_none())
         .map(|w| displayed_percent(w.used, &basis))
 }
@@ -1185,7 +1304,7 @@ struct TrayOption {
 
 #[tauri::command]
 fn get_tray_options(app: AppHandle) -> Vec<TrayOption> {
-    TRAY_PROVIDER_IDS
+    let mut options: Vec<TrayOption> = TRAY_PROVIDER_IDS
         .iter()
         .map(|id| TrayOption {
             id: (*id).to_string(),
@@ -1193,7 +1312,30 @@ fn get_tray_options(app: AppHandle) -> Vec<TrayOption> {
             status: snapshot_of(&app, id).status,
             used: ring_pct(&app, id),
         })
-        .collect()
+        .collect();
+    for kind in [profiles::Kind::Claude, profiles::Kind::Codex] {
+        let accounts: Vec<_> = managed::views(&app).into_iter().filter(|a| a.provider == kind.id()).collect();
+        if accounts.is_empty() { continue; }
+        if let Some(index) = options.iter().position(|p| p.id == kind.id()) {
+            options.remove(index);
+            for (offset, a) in accounts.into_iter().enumerate() {
+                let connected = !a.disconnected;
+                options.insert(index + offset, TrayOption { id:a.id.clone(), label:a.label, status:if connected { a.snapshot.status } else { "disconnected".into() },
+                    used:if connected { ring_pct(&app,&a.id) } else { None } });
+            }
+        }
+    }
+    for kind in [profiles::Kind::Claude, profiles::Kind::Codex] {
+        if managed::has_provider(&app,kind.id()) { continue; }
+        if let Some(profile) = multi::selected(&app, kind) {
+            if let Some(index) = options.iter().position(|p| p.id == kind.id()) {
+                let connected = multi::active(&app, kind).is_some();
+                if connected { options[index].label = format!("{} 1", provider_label(kind.id())); }
+                options.insert(index + 1, TrayOption { id: profile.id.clone(), label: format!("{} 2", provider_label(kind.id())), status: if connected { snapshot_of(&app, &profile.id).status } else { "disconnected".into() }, used: if connected { ring_pct(&app, &profile.id) } else { None } });
+            }
+        }
+    }
+    options
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1245,7 +1387,13 @@ const RING_LIMIT_VALUES: [&str; 4] = ["automatic", "5h", "weekly", "monthly"];
 fn get_ring_limits(app: AppHandle) -> std::collections::HashMap<String, String> {
     let st = app.state::<AppState>();
     let c = st.cfg.lock().unwrap();
-    TRAY_PROVIDER_IDS.iter().map(|id| (id.to_string(), ring_limit_for(&c, id))).collect()
+    let mut all: std::collections::HashMap<_, _> = TRAY_PROVIDER_IDS.iter().map(|id| (id.to_string(), ring_limit_for(&c, id))).collect();
+    for kind in [profiles::Kind::Claude, profiles::Kind::Codex] {
+        let configured = if kind == profiles::Kind::Codex { c.codex_profile_2.as_deref() } else { c.claude_profile_2.as_deref() };
+        if let Some(profile) = profiles::second(kind, configured) { all.insert(profile.id.clone(), ring_limit_for(&c, &profile.id)); }
+    }
+    for a in &c.managed_accounts { all.insert(format!("{}-managed-{}", a.provider, a.slot), ring_limit_for(&c, &format!("{}-managed-{}", a.provider, a.slot))); }
+    all
 }
 
 /// Sets one provider's ring metric and returns every provider's, so a caller can just replace its
@@ -1259,7 +1407,7 @@ fn set_ring_limit(app: AppHandle, provider: String, limit: String) -> std::colle
             c.ring_limits.insert(provider, limit);
         }
         config::save(&c);
-        TRAY_PROVIDER_IDS.iter().map(|id| (id.to_string(), ring_limit_for(&c, id))).collect::<std::collections::HashMap<_, _>>()
+        c.ring_limits.iter().map(|(id, value)| (id.clone(), value.clone())).collect::<std::collections::HashMap<_, _>>()
     };
     let _ = app.emit("ring_limits", &all);
     repaint_tray(&app);
@@ -1599,6 +1747,8 @@ fn quit_app(app: AppHandle) {
 pub fn provider_label(id: &str) -> &'static str {
     match id {
         "codex" => "Codex",
+        id if id.starts_with("codex-") => "Codex 2",
+        id if id.starts_with("claude-") => "Claude 2",
         "cursor" => "Cursor",
         "gemini" => "Antigravity",
         "grok" => "Grok",
@@ -1654,9 +1804,14 @@ fn paint_tray(app: &AppHandle, mode: &str, slots: &[config::TraySlot], values: &
         .iter()
         .zip(values.iter())
         .map(|(slot, v)| {
+            let name = match slot.provider.as_str() {
+                "codex" if multi::active(app, profiles::Kind::Codex).is_some() => "Codex 1",
+                "claude" if multi::active(app, profiles::Kind::Claude).is_some() => "Claude 1",
+                _ => provider_label(&slot.provider),
+            };
             format!(
                 "{} {}",
-                provider_label(&slot.provider),
+                name,
                 v.map(|p| format!("{p}%")).unwrap_or_else(|| "—".into())
             )
         })
@@ -1793,6 +1948,7 @@ fn main() {
 
     let cfg = config::load();
     let port = cfg.port;
+    let managed_snapshots = managed::load_snapshots(&cfg.managed_accounts);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -1806,6 +1962,7 @@ fn main() {
             cfg: Mutex::new(cfg),
             usage: Mutex::new(usage::load_persisted()),
             codex: Mutex::new(codex::load_persisted()),
+            second: Mutex::new(managed_snapshots),
             cursor: Mutex::new(cursor::load_persisted()),
             antigravity: Mutex::new(antigravity::load_persisted()),
             grok: Mutex::new(grok::load_persisted()),
@@ -1823,6 +1980,18 @@ fn main() {
             get_state,
             get_usage,
             get_codex,
+            get_second_accounts,
+            get_managed_accounts,
+            begin_managed_login,
+            get_managed_login_state,
+            confirm_managed_login,
+            cancel_managed_login,
+            set_managed_disconnected,
+            remove_managed_account,
+            get_second_profile,
+            set_second_profile,
+            get_second_enabled,
+            set_second_enabled,
             get_cursor,
             get_antigravity,
             get_grok,
@@ -1916,6 +2085,8 @@ fn main() {
             watcher::start(handle.clone());
             usage::start(handle.clone());
             codex::start(handle.clone());
+            multi::start(handle.clone());
+            managed::start(handle.clone());
             cursor::start(handle.clone());
             antigravity::start(handle.clone());
             grok::start(handle.clone());

@@ -12,6 +12,7 @@
   [hidden]{display:none!important}
   html,body{margin:0;padding:0;height:100%}
   :root{
+    color-scheme:dark;
     --settings-sidebar:200px;
     --selection:#0a84ff;
     --window-bg:rgba(61,61,63,.94);
@@ -125,9 +126,13 @@
   .sw:focus-visible{outline:1px solid #8a8a8a;outline-offset:2px}
 
   select{
-    background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.12);border-radius:7px;color:#f5f5f7;font:inherit;
+    color-scheme:dark;background:#343438;border:1px solid rgba(255,255,255,.20);border-radius:7px;color:#f5f5f7;font:inherit;
     font-size:12px;padding:6px 8px;max-width:100%;cursor:pointer;
   }
+  select option{background:#242428;color:#f5f5f7}
+  select option:checked{background:#0a84ff;color:#fff}
+  select option:disabled{background:#242428;color:#9999a0}
+  select:disabled{background:#2b2b2e;color:#aaaab0;cursor:default;opacity:1}
   select:hover{border-color:#3f3f3f}
   select:focus-visible{outline:1px solid #8a8a8a;outline-offset:1px}
 
@@ -446,6 +451,23 @@
         <div class="np-list" id="notch-list"></div>
         <div class="c-note dim" id="notch-note" style="margin-top:6px"></div>
       </div>
+      <div class="block">
+        <div class="b-head">Managed accounts</div>
+        <div class="b-sub">Add up to two Codex and two Claude accounts. Each login uses the official CLI in private app storage. Your usual CLI login stays untouched.</div>
+        <div id="managed-accounts"></div>
+        <div class="c-note dim" id="managed-note" style="margin-top:8px"></div>
+      </div>
+      <details class="block" style="padding-top:12px">
+        <summary>Advanced · Existing account directories</summary>
+        <div class="b-sub">Legacy profile monitoring. Register an existing signed-in folder only if you already use this setup.</div>
+        <div class="r-name" style="margin-top:12px">Codex 2</div>
+        <div style="display:flex;gap:6px;margin-top:6px"><input id="profile-codex" type="text" spellcheck="false" placeholder="C:\Users\you\.codex-work" aria-label="Codex 2 directory" style="flex:1;min-width:0;padding:8px;border:1px solid #666;border-radius:6px;background:#222;color:#fff"><button id="save-codex-profile" type="button">Add existing</button><button id="auto-codex-profile" type="button">Auto</button></div>
+        <button id="toggle-codex-profile" type="button" style="margin-top:6px">Disconnect Codex 2</button>
+        <div class="r-name" style="margin-top:14px">Claude 2</div>
+        <div style="display:flex;gap:6px;margin-top:6px"><input id="profile-claude" type="text" spellcheck="false" placeholder="C:\Users\you\.claude-work" aria-label="Claude 2 directory" style="flex:1;min-width:0;padding:8px;border:1px solid #666;border-radius:6px;background:#222;color:#fff"><button id="save-claude-profile" type="button">Add existing</button><button id="auto-claude-profile" type="button">Auto</button></div>
+        <button id="toggle-claude-profile" type="button" style="margin-top:6px">Disconnect Claude 2</button>
+        <div class="c-note dim" id="profile-note" style="margin-top:8px">Only a different signed-in account can become account 2.</div>
+      </details>
     </section>
 
     <!-- GENERAL / Behaviour ---------------------------------------------------------------- -->
@@ -529,7 +551,7 @@
           <img class="about-mark" data-logo src="tray.png" alt="Provider Monitor">
           <div>
             <div class="about-name">Provider Monitor</div>
-            <div class="about-ver">Version <span id="about-version">1.17.4</span></div>
+            <div class="about-ver">Version <span id="about-version">1.18.1</span></div>
           </div>
         </div>
         <div class="c-note dim" style="margin-top:10px">Shows supported providers' allowance in the taskbar icon and in a pill at the edge of the screen.</div>
@@ -713,6 +735,10 @@ const KO_STATIC = {
   'Notch':'노치', 'Notifications':'알림', 'General':'일반', 'Behaviour':'동작', 'Claude Code':'Claude Code', 'About':'정보',
   'Close':'닫기', 'Minimize':'최소화', 'Window controls':'창 제어', 'Quit Provider Monitor':'Provider Monitor 종료',
   'Connected':'연결됨',
+  'Managed accounts':'관리 계정',
+  'Add up to two Codex and two Claude accounts. Each login uses the official CLI in private app storage. Your usual CLI login stays untouched.':'Codex와 Claude 계정을 각각 최대 두 개 등록할 수 있습니다. 공식 CLI가 앱 전용 공간에서 로그인하며 평소 CLI 계정은 그대로 유지됩니다.',
+  'Advanced · Existing account directories':'고급 · 기존 계정 폴더',
+  'Legacy profile monitoring. Register an existing signed-in folder only if you already use this setup.':'기존 프로필 모니터링입니다. 이미 사용 중인 로그인 폴더가 있을 때만 연결하세요.',
   'Connected providers appear in this order. Change each ring\'s period without affecting the others.':'연결된 프로바이더가 이 순서대로 표시됩니다. 다른 링에는 영향을 주지 않고 각 링의 기간을 바꿀 수 있습니다.',
   'Click a provider to show or hide its ring. Use the arrows to change the order.':'프로바이더를 클릭하여 링을 표시하거나 숨깁니다. 화살표로 순서를 바꿉니다.',
   'The notch and taskbar icon use the same readings. Adjust what stays visible and how large it is.':'노치와 트레이 아이콘은 같은 측정값을 사용합니다. 무엇을 계속 표시할지와 크기를 정합니다.',
@@ -1715,6 +1741,158 @@ try {
 })();
 
 /* ---- start ------------------------------------------------------------- */
+function reloadAccounts(){
+  return call('get_tray_options', undefined, []).then(opts=>{
+    if(!Array.isArray(opts)) return;
+    options=opts.filter(o=>o&&typeof o.id==='string');
+    render();refreshPreview();
+  });
+}
+const managedRows = new Map(), managedPending = new Map();
+const mt = (en, ko) => uiLang === 'ko' ? ko : en;
+const managedRoot = document.getElementById('managed-accounts');
+for(const provider of ['codex','claude']) for(const slot of [1,2]){
+  const key=provider+'-'+slot;
+  const box=document.createElement('div');
+  box.className='row'; box.style.cssText='display:block;padding:12px 0;border-bottom:1px solid #333';
+  box.dataset.managedKey=key;
+  const title=document.createElement('div'); title.className='r-name'; title.textContent=(provider==='codex'?'Codex':'Claude')+' '+slot;
+  const identity=document.createElement('div'); identity.className='r-why'; identity.dataset.part='identity';
+  const status=document.createElement('div'); status.className='c-note dim'; status.dataset.part='status';
+  const name=document.createElement('input'); name.type='text'; name.maxLength=48; name.dataset.part='label'; name.placeholder=mt('Display name (optional)','표시 이름 (선택)');
+  name.style.cssText='width:100%;margin:7px 0;padding:8px;border:1px solid #666;border-radius:6px;background:#222;color:#fff';
+  const buttons=document.createElement('div'); buttons.style.cssText='display:flex;gap:6px;flex-wrap:wrap;margin-top:6px';
+  for(const action of ['login','confirm','cancel','refresh','disconnect','remove']){
+    const button=document.createElement('button');button.type='button';button.dataset.action=action;
+    button.addEventListener('click',async()=>{
+      const row=managedRows.get(key), pending=managedPending.get(key);
+      try{
+        if(action==='login'){
+          const state=await invoke('begin_managed_login',{provider,slot}); managedPending.set(key,state);
+        }else if(action==='confirm'){
+          if(!pending || pending.state!=='ready') return;
+          await invoke('confirm_managed_login',{provider,slot,label:name.value.trim()}); managedPending.delete(key);
+          await reloadAccounts();
+          const saved=await call('get_tray_config',undefined,null);
+          if(saved){cfg={mode:saved.mode,slots:saved.slots||[]};render();refreshPreview();}
+        }else if(action==='cancel'){
+          await invoke('cancel_managed_login',{provider,slot}); managedPending.delete(key);
+        }else if(action==='refresh'){
+          await invoke('refresh_provider',{provider:provider+'-managed-'+slot});
+        }else if(action==='disconnect' && row){
+          await invoke('set_managed_disconnected',{provider,slot,disconnected:!row.disconnected});
+        }else if(action==='remove' && row){
+          await invoke('remove_managed_account',{provider,slot});
+          await reloadAccounts();
+        }
+        await reloadManaged();
+      }catch(e){document.getElementById('managed-note').textContent=errText(e);}
+    });
+    buttons.appendChild(button);
+  }
+  box.append(title,identity,status,name,buttons);managedRoot.appendChild(box);
+}
+function renderManaged(){
+  for(const box of managedRoot.querySelectorAll('[data-managed-key]')){
+    const key=box.dataset.managedKey, [provider,slotText]=key.split('-'), slot=Number(slotText);
+    const row=managedRows.get(key), pending=managedPending.get(key);
+    const isBusy=pending&&['authenticating','checking'].includes(pending.state);
+    const identity=pending?.identity||row?.identity;
+    box.querySelector('[data-part=identity]').textContent=identity
+      ? mt('Account: ','계정: ')+identity.replace('\u001f',' · ')
+      : mt('No managed account registered','등록된 관리 계정 없음');
+    const note=row?.snapshot?.note||'';
+    box.querySelector('[data-part=status]').textContent=pending?.message||
+      (row ? (row.disconnected?mt('Disconnected','연결 해제됨'):(note||row.snapshot?.status||mt('Waiting for usage','사용량 확인 대기'))) :
+        mt('Use Add account to sign in with the official CLI.','계정 추가를 눌러 공식 CLI로 로그인하세요.'));
+    const label=box.querySelector('[data-part=label]');
+    label.placeholder=mt('Display name (optional)','표시 이름 (선택)');
+    label.hidden=!!row && pending?.state!=='ready';
+    if(row && !pending && document.activeElement!==label) label.value=row.label||'';
+    const button=action=>box.querySelector('[data-action='+action+']');
+    button('login').hidden=!!pending;
+    button('login').textContent=row?mt('Reauthenticate','다시 인증'):mt('Add account','계정 추가');
+    button('confirm').hidden=pending?.state!=='ready'; button('confirm').textContent=mt('Confirm account','계정 확인 후 등록');
+    button('cancel').hidden=!pending; button('cancel').textContent=mt('Cancel','취소');
+    button('refresh').hidden=!row||!!row.disconnected; button('refresh').textContent=mt('Refresh','새로고침');
+    button('disconnect').hidden=!row||!!pending; button('disconnect').textContent=row?.disconnected?mt('Reconnect','다시 연결'):mt('Disconnect','연결 해제');
+    button('remove').hidden=!row||!!pending; button('remove').textContent=mt('Remove from monitor','모니터에서 제거');
+    if(isBusy) button('login').disabled=true; else button('login').disabled=false;
+  }
+}
+async function reloadManaged(){
+  const rows=await call('get_managed_accounts',undefined,[]);
+  managedRows.clear();
+  for(const row of rows||[]) managedRows.set(row.provider+'-'+row.slot,row);
+  for(const provider of ['codex','claude']){
+    const managed=(rows||[]).some(row=>row.provider===provider);
+    for(const id of ['profile-'+provider,'save-'+provider+'-profile','auto-'+provider+'-profile']) document.getElementById(id).disabled=managed;
+    if(managed) document.getElementById('toggle-'+provider+'-profile').hidden=true;
+  }
+  renderManaged();
+}
+function noManagedLogin(e){return /no login in progress/i.test(errText(e));}
+async function readManagedLogin(provider,slot,previous){
+  const key=provider+'-'+slot;
+  try{
+    const state=await invoke('get_managed_login_state',{provider,slot});
+    if(managedPending.get(key)===previous) managedPending.set(key,state);
+  }catch(e){
+    if(noManagedLogin(e)){
+      if(previous && managedPending.get(key)===previous) managedPending.delete(key);
+    }else strip('get_managed_login_state failed: '+errText(e));
+  }
+}
+// A recreated settings window can rejoin a login that the app still owns.
+async function bootstrapManaged(){
+  for(const provider of ['codex','claude']) for(const slot of [1,2]){
+    const key=provider+'-'+slot;
+    if(!managedPending.has(key)) await readManagedLogin(provider,slot,undefined);
+  }
+  renderManaged();
+}
+let managedPollBusy=false;
+async function pollManaged(){
+  if(managedPollBusy) return;
+  managedPollBusy=true;
+  try{
+    for(const provider of ['codex','claude']) for(const slot of [1,2]){
+      const key=provider+'-'+slot, previous=managedPending.get(key);
+      if(previous && ['authenticating','checking'].includes(previous.state)) await readManagedLogin(provider,slot,previous);
+    }
+  }finally{managedPollBusy=false;renderManaged();}
+}
+reloadManaged().then(bootstrapManaged);setInterval(pollManaged,2000);
+for(const provider of ['codex','claude']){
+  const input=document.getElementById('profile-'+provider);
+  const toggle=document.getElementById('toggle-'+provider+'-profile');
+  let enabled=true;
+  const updateToggle=()=>{toggle.textContent=(enabled?'Disconnect ':'Reconnect ')+(provider==='codex'?'Codex 2':'Claude 2');};
+  toggle.hidden=true;
+  call('get_second_enabled',{provider},null).then(value=>{enabled=value!==false;toggle.hidden=value==null;updateToggle();});
+  call('get_second_profile',{provider},null).then(path=>{if(typeof path==='string')input.value=path;});
+  toggle.addEventListener('click',()=>{
+    invoke('set_second_enabled',{provider,enabled:!enabled}).then(()=>{enabled=!enabled;updateToggle();reloadAccounts();})
+      .catch(e=>strip(errText(e)));
+  });
+  document.getElementById('save-'+provider+'-profile').addEventListener('click',()=>{
+    const path=input.value.trim();
+    if(!path){strip('Enter an existing signed-in profile directory');return;}
+    invoke('set_second_profile',{provider,path}).then(()=>{
+      enabled=true;updateToggle();
+      document.getElementById('profile-note').textContent=ui('Account 2 directory saved. Usage will update shortly.','Account 2 directory saved. Usage will update shortly.');
+      reloadAccounts();
+    }).catch(e=>strip(errText(e)));
+  });
+  document.getElementById('auto-'+provider+'-profile').addEventListener('click',()=>{
+    invoke('set_second_profile',{provider,path:''}).then(()=>{
+      enabled=true;updateToggle();
+      input.value='';
+      document.getElementById('profile-note').textContent=ui('Automatic profile discovery enabled.','Automatic profile discovery enabled.');
+      reloadAccounts();
+    }).catch(e=>strip(errText(e)));
+  });
+}
 function boot(){
   setUiLanguage('auto');
   showTab(savedTab());

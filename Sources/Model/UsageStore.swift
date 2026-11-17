@@ -30,7 +30,85 @@ final class UsageStore: ObservableObject {
     /// summaries without re-reading every credential on every polling pass.
     @Published private(set) var providerAccountRevision = 0
 
-    private let providers: [UsageProvider]
+    private var providers: [UsageProvider]
+    var managedAccounts: ManagedAccountController?
+    var onAccountAdded: ((UsageProvider) -> Void)?
+
+    /// A confirmed registration replaces only this family's monitoring sources.
+    /// Existing CLI credentials and unrelated providers are never changed.
+    func replaceFamily(_ family: MonitoredAccounts.Family, with replacements: [UsageProvider]) {
+        let previous = providers.filter { family.contains($0.id) }
+        let ids = Set(previous.map(\.id))
+        for id in ids { cancelRefresh(providerID: id) }
+        let insertion = providers.firstIndex { family.contains($0.id) } ?? providers.count
+        providers.removeAll { family.contains($0.id) }
+        providers.insert(contentsOf: replacements, at: min(insertion, providers.count))
+        let replacementIDs = Set(replacements.map(\.id))
+        for id in ids.subtracting(replacementIDs) {
+            lastGood[id] = nil
+            diagnostics[id] = nil
+            refusedAccess.remove(id)
+            needsRenewal.remove(id)
+        }
+        archive.save(lastGood)
+        snapshots.removeAll { family.contains($0.id) }
+        for provider in replacements where !disconnected.contains(provider.id) {
+            publish(Self.placeholder(provider))
+        }
+        providerAccountRevision += 1
+        for provider in replacements { refresh(providerID: provider.id) }
+    }
+
+    /// Register an existing login without copying, switching or writing its token.
+    @discardableResult
+    func addAccount(_ family: MonitoredAccounts.Family, directory: URL,
+                    defaults: UserDefaults = .standard) throws -> String {
+        let existing = providers.filter { family.contains($0.id) }
+        guard !existing.contains(where: { $0 is ManagedAccountProvider }) else {
+            throw MonitoredAccounts.RegistrationError.full
+        }
+        guard existing.count < 2 else { throw MonitoredAccounts.RegistrationError.full }
+        let directory = directory.resolvingSymlinksInPath().standardizedFileURL
+        let provider: UsageProvider
+        switch family {
+        case .codex:
+            let profile = CodexProfile(slug: "account-2", configDirectory: directory)
+            guard !existing.compactMap({ ($0 as? CodexLocalProvider)?.profile.configDirectory })
+                .contains(where: { $0.resolvingSymlinksInPath().standardizedFileURL.path == directory.path })
+            else { throw MonitoredAccounts.RegistrationError.sameDirectory }
+            guard let identity = CodexCredentials.usageAccountID(from: profile.authURL) else {
+                throw MonitoredAccounts.RegistrationError.missingCredential
+            }
+            guard !existing.contains(where: { $0.usageAccountID == identity }) else {
+                throw MonitoredAccounts.RegistrationError.sameAccount
+            }
+            provider = CodexLocalProvider(profile: profile)
+        case .claude:
+            let profile = ClaudeProfile(slug: "account-2", configDirectory: directory)
+            let profiles = existing.compactMap { ($0 as? ClaudeOAuthProvider)?.profile }
+            guard !profiles.contains(where: { $0.configDirectory.resolvingSymlinksInPath().standardizedFileURL.path == directory.path })
+            else { throw MonitoredAccounts.RegistrationError.sameDirectory }
+            guard ClaudeProfile.hasKeychainCredential(profile) else {
+                throw MonitoredAccounts.RegistrationError.missingCredential
+            }
+            if let identity = MonitoredAccounts.claudeIdentity(profile),
+               profiles.contains(where: { MonitoredAccounts.claudeIdentity($0) == identity }) {
+                throw MonitoredAccounts.RegistrationError.sameAccount
+            }
+            provider = ClaudeOAuthProvider(profile: profile)
+        }
+        MonitoredAccounts.save(directory, family: family, defaults: defaults)
+        providers.append(provider)
+        // A newly registered path must never inherit an archived account's numbers.
+        lastGood.removeValue(forKey: provider.id)
+        archive.save(lastGood)
+        disconnected.remove(provider.id)
+        publish(Self.placeholder(provider))
+        onAccountAdded?(provider)
+        providerAccountRevision += 1
+        refresh(providerID: provider.id)
+        return provider.id
+    }
 
     /// Provider ids plus any model cells currently on screen.
     var knownIDs: [String] {
@@ -208,13 +286,28 @@ final class UsageStore: ObservableObject {
             // mind a minute later when the first fetch lands.
             return applyingRingCadence(snapshot)
         }
+        snapshots = snapshots.map(accountPresented)
         updateNotchSnapshots()
+    }
+
+    private func accountPresented(_ value: ProviderSnapshot) -> ProviderSnapshot {
+        var snapshot = value
+        let ids = providers.map(\.id)
+        if let managed = providers.first(where: { $0.id == snapshot.id }) as? ManagedAccountProvider {
+            snapshot.accountNumber = managed.record.slot
+            snapshot.displayName = managed.record.name
+        } else {
+            snapshot.accountNumber = MonitoredAccounts.number(for: snapshot.id, among: ids)
+            snapshot.displayName = MonitoredAccounts.name(for: snapshot.id, original: snapshot.displayName, among: ids)
+        }
+        return snapshot
     }
 
     private func updateNotchSnapshots() {
         let cells = ProviderOrder.cells(from: snapshots, keeping: notchSnapshots)
         notchSnapshots = ProviderOrder.arrange(cells, by: order, id: \.id)
             .filter { !disconnected.contains($0.id) }
+            .map(accountPresented)
     }
 
     /// Model discovery does not need to re-read any cloud account's credential.
@@ -241,7 +334,10 @@ final class UsageStore: ObservableObject {
             snapshot.weeklyID.map { (snapshot.providerID, $0) }
         }, uniquingKeysWith: { first, _ in first })
         let summaries = orderedProviders.flatMap { provider in
-            let summary = ProviderSummary(kind: provider.kind, id: provider.id, name: provider.displayName,
+            let managed = provider as? ManagedAccountProvider
+            let summary = ProviderSummary(accountNumber: managed?.record.slot ?? MonitoredAccounts.number(for: provider.id, among: providers.map(\.id)),
+                            kind: provider.kind, id: provider.id,
+                            name: managed?.record.name ?? MonitoredAccounts.name(for: provider.id, original: provider.displayName, among: providers.map(\.id)),
                             glyph: provider.glyph,
                             account: disconnected.contains(provider.id) ? nil : provider.account(),
                             signIn: provider.signInRoute,
@@ -559,7 +655,7 @@ final class UsageStore: ObservableObject {
         let snapshot = applyingRingCadence(snapshot)
         var current = Dictionary(uniqueKeysWithValues: snapshots.map { ($0.id, $0) })
         current[snapshot.id] = snapshot
-        snapshots = orderedProviders.compactMap { disconnected.contains($0.id) ? nil : current[$0.id] }
+        snapshots = orderedProviders.compactMap { disconnected.contains($0.id) ? nil : current[$0.id] }.map(accountPresented)
     }
 
     /// Sign out of one provider: discard anything of its account that this app
@@ -891,7 +987,9 @@ final class UsageStore: ObservableObject {
         // through one of those would present a number that is no longer true —
         // and, after an endpoint change, one that came from somewhere we no
         // longer read. So the remembered reading is dropped, not dimmed.
-        if Self.supersedesHistory(status) && !(status == .needsAuth && sameAccount) {
+        let identityRejected: Bool
+        if case UsageProviderError.accountChanged = error { identityRejected = true } else { identityRejected = false }
+        if identityRejected || (Self.supersedesHistory(status) && !(status == .needsAuth && sameAccount)) {
             lastGood[provider.id] = nil
             archive.save(lastGood)
             var empty = Self.placeholder(provider)

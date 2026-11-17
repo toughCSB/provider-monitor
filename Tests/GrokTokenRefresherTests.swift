@@ -317,6 +317,20 @@ final class GrokTokenRefresherTests: XCTestCase {
         XCTAssertEqual(errno, ESRCH, "specifically gone, not merely unreachable for some other reason")
     }
 
+    func testRenewalDoesNotSendEOFBeforeAuthenticationCanFinish() async throws {
+        let dir=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at:dir,withIntermediateDirectories:true)
+        defer { try? FileManager.default.removeItem(at:dir) }
+        let cli=dir.appendingPathComponent("grok")
+        try "#!/bin/sh\n: > \"$0.started\"\nIFS= read -r request\n: > \"$0.eof\"\nexit 0\n".write(to:cli,atomically:true,encoding:.utf8)
+        try FileManager.default.setAttributes([.posixPermissions:0o700],ofItemAtPath:cli.path)
+        let (_, exit)=try GrokTokenRefresher.run(cli,timeout:1)
+        _ = await exit()
+        XCTAssertTrue(FileManager.default.fileExists(atPath:cli.path+".started"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath:cli.path+".eof"),
+                       "An idle stdio service must not receive EOF before authentication finishes")
+    }
+
     /// A script that ignores SIGTERM, so the SIGKILL fallback is the only way
     /// out — the path this test is for, not the gentler one. Written fresh each
     /// time rather than checked in: it needs the executable bit, which a git

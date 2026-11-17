@@ -561,7 +561,7 @@ private struct ProviderTooltip: View {
                           : L10n.t("\(snapshot.displayName) Usage"),
                           subtitle: snapshot.plan,
                           note: readingAge ?? activityNote ?? (snapshot.localModel?.brand != nil ? snapshot.displayName : nil)) {
-                ProviderGlyphView(glyph: snapshot.glyph)
+                ProviderGlyphView(glyph: snapshot.glyph, accountNumber: snapshot.accountNumber)
                     .foregroundStyle(Palette.textPrimary)
             }
 

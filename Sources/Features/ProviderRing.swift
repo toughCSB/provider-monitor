@@ -16,6 +16,7 @@ struct ProviderRing: View {
     /// to describe exhaustion risk from `usedFraction`.
     var displayedFraction: Double? = nil
     let glyph: ProviderGlyph
+    var accountNumber: Int? = nil
     var isStale: Bool = false
     /// Blocked right now. Shown as spent whatever the arc says, because that is
     /// what it means for you — a ring reading 16% while the account is paused
@@ -158,7 +159,7 @@ struct ProviderRing: View {
             }
             .opacity(isStale ? (reduceTransparency ? 0.75 : 0.45) : 1)
 
-            ProviderGlyphView(glyph: glyph)
+            ProviderGlyphView(glyph: glyph, accountNumber: accountNumber)
                 .foregroundStyle(Palette.textPrimary)
                 // A spent limit dims its glyph so the ring reads as "waiting".
                 // Under reduce-transparency, boost opacity so it stays legible without low alpha.
@@ -281,6 +282,7 @@ struct ProviderCell: View {
                 usedFraction: snapshot.localModel == nil && snapshot.hasReading ? snapshot.ringFraction : nil,
                 displayedFraction: snapshot.localModel == nil && snapshot.hasReading ? snapshot.displayedRingFraction : nil,
                 glyph: snapshot.glyph,
+                accountNumber: snapshot.accountNumber,
                 isStale: snapshot.status.isStale || !snapshot.hasReading,
                 isBlocked: snapshot.block != nil,
                 activity: activity,
@@ -297,6 +299,17 @@ struct ProviderCell: View {
                 if let cadence = cadenceBadge {
                     CadenceBadge(cadence: cadence)
                         .offset(x: -NotchLayout.badgeOffset, y: -NotchLayout.badgeOffset)
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if let number = snapshot.accountNumber {
+                    Text("\(number)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(ProviderBrand.markColor(snapshot.glyph, accountNumber: number) ?? .primary)
+                        .frame(width: 15, height: 15)
+                        .background(Palette.card, in: Circle())
+                        .overlay(Circle().strokeBorder(Palette.textSecondary.opacity(0.4), lineWidth: 0.5))
+                        .offset(x: 2, y: 2)
                 }
             }
             Text(readingText)

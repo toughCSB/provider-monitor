@@ -60,6 +60,18 @@ pub struct TraySlot {
     pub provider: String,
 }
 
+/// One of two independent, app-owned sign-ins per provider. No credential is stored here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedAccount {
+    pub provider: String,
+    pub slot: u8,
+    pub directory: PathBuf,
+    pub identity: String,
+    pub label: String,
+    #[serde(default)]
+    pub disconnected: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_port")]
@@ -130,6 +142,23 @@ pub struct Config {
     /// provider gets an entry, keyed the same as the notch/tray ids.
     #[serde(default)]
     pub ring_limits: HashMap<String, String>,
+    /// Optional existing account-2 directories. Empty selects a credential-bearing .codex-*/.claude-* sibling.
+    #[serde(default)]
+    pub codex_profile_2: Option<String>,
+    #[serde(default)]
+    pub claude_profile_2: Option<String>,
+    /// The first verified automatic choice is pinned, so logging out never swaps account 2.
+    #[serde(default)]
+    pub codex_auto_profile_2: Option<String>,
+    #[serde(default)]
+    pub claude_auto_profile_2: Option<String>,
+    /// Disconnect account 2 without losing its selected directory or reading credentials.
+    #[serde(default)]
+    pub codex_second_disconnected: bool,
+    #[serde(default)]
+    pub claude_second_disconnected: bool,
+    #[serde(default)]
+    pub managed_accounts: Vec<ManagedAccount>,
     /// The model family that choice looks at, as the Mac app's "Model data": "gemini" or "3p"
     #[serde(default = "default_antigravity_model")]
     pub antigravity_model: String,
@@ -224,6 +253,13 @@ impl Default for Config {
             notch_providers: Vec::new(), // empty = show them all
             notch_slots: Vec::new(),     // filled in by load(), from notch_providers
             ring_limits: HashMap::new(),
+            codex_profile_2: None,
+            claude_profile_2: None,
+            codex_auto_profile_2: None,
+            claude_auto_profile_2: None,
+            codex_second_disconnected: false,
+            claude_second_disconnected: false,
+            managed_accounts: Vec::new(),
             antigravity_model: default_antigravity_model(),
             notch_visible: true,
             tray_visible: true,

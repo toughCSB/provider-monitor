@@ -1,5 +1,34 @@
 //! Small, shared timing rules for provider polling. All deadlines are epoch milliseconds.
 
+/// npm installs expose .cmd launchers; CreateProcess cannot execute those directly.
+pub(crate) fn cli_command(cli: &std::path::Path) -> std::process::Command {
+    if cli.extension().is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("cmd")) {
+        let mut command=std::process::Command::new("cmd.exe");
+        command.args(["/d","/c"]).arg(cli);
+        command
+    } else { std::process::Command::new(cli) }
+}
+
+pub(crate) fn wait_for_renewal(child: &mut std::process::Child, timeout: std::time::Duration) -> std::io::Result<()> {
+    let deadline=std::time::Instant::now()+timeout;
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            #[cfg(windows)] {
+                use std::os::windows::process::CommandExt;
+                let _=std::process::Command::new("taskkill.exe")
+                    .args(["/PID",&child.id().to_string(),"/T","/F"])
+                    .creation_flags(0x0800_0000)
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+            }
+            let _=child.kill();
+            let _=child.wait();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 pub fn retry_after_secs(header: Option<&str>, now_ms: u64, fallback_secs: u64) -> u64 {
     retry_after_hint_secs(header, now_ms).unwrap_or(fallback_secs)
 }
@@ -54,6 +83,13 @@ impl RenewalBudget {
             self.last_attempt = None;
             self.finished = false;
         }
+        // A network outage or unavailable CLI must not disable renewal for the
+        // rest of the app's lifetime. After a failed burst, retry at most hourly.
+        if self.attempts >= 3 && !self.finished
+            && self.last_attempt.is_some_and(|last| now.saturating_sub(last) >= cooldown_ms.max(3_600_000)) {
+            self.attempts = 0;
+            self.last_attempt = None;
+        }
         if !eligible || self.finished || self.attempts >= 3 || self.last_attempt.is_some_and(|last| now.saturating_sub(last) < cooldown_ms) {
             return false;
         }
@@ -70,6 +106,14 @@ impl RenewalBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn npm_cli_launcher_uses_command_processor_without_changing_native_launchers() {
+        let command=cli_command(std::path::Path::new("claude.cmd"));
+        assert_eq!(command.get_program(),"cmd.exe");
+        assert_eq!(command.get_args().map(|x|x.to_str().unwrap()).collect::<Vec<_>>(),vec!["/d","/c","claude.cmd"]);
+        assert_eq!(cli_command(std::path::Path::new("grok.exe")).get_program(),"grok.exe");
+    }
 
     #[test]
     fn server_hint_is_exact_and_deadline_rounds_up() {
@@ -127,5 +171,16 @@ mod tests {
         assert!(!budget.claim(Some(100), 700, true, 600));
         assert!(!budget.claim(Some(100), 1_300, true, 600));
         assert!(budget.claim(Some(200), 1_300, true, 600));
+    }
+
+    #[test]
+    fn exhausted_renewal_recovers_after_outage_without_restart_or_new_expiry() {
+        let mut budget=RenewalBudget::default();
+        for now in [100,700,1300] { assert!(budget.claim(Some(100),now,true,600)); }
+        assert!(!budget.claim(Some(100),3_601_299,true,600));
+        assert!(budget.claim(Some(100),3_601_300,true,600));
+        assert!(!budget.claim(Some(100),3_601_301,true,600));
+        budget.finish_for_current_expiry();
+        assert!(!budget.claim(Some(100),9_000_000,true,600));
     }
 }

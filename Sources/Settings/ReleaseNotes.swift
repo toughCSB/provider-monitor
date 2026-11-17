@@ -32,6 +32,44 @@ enum ReleaseNotes {
     static var all: [ReleaseNote] {
         [
             ReleaseNote(
+                version: "1.18.3",
+                headline: L10n.t("Clearer quota periods and automatic session recovery."),
+                changes: [
+                    ReleaseNote.Change(title: L10n.t("Registered Codex accounts use familiar time labels"),
+                        detail: L10n.t("Weekly and monthly limits use the same labels as existing accounts. Reset countdowns keep the provider's actual deadline.")),
+                    ReleaseNote.Change(title: L10n.t("Session renewal resumes after temporary failures"),
+                        detail: L10n.t("An exhausted renewal retry budget no longer disables recovery until the app restarts. Account changes still clear the previous account's readings."))
+                ]
+            ),
+            ReleaseNote(
+                version: "1.18.2",
+                headline: L10n.t("Claude account sign-in keeps access to your Mac keychain."),
+                changes: [
+                    ReleaseNote.Change(title: L10n.t("Account folders no longer replace the system home"),
+                        detail: L10n.t("Official CLI sign-in uses its own account folder while keeping the normal macOS home and login keychain. Existing accounts and settings are preserved."))
+                ]
+            ),
+            ReleaseNote(
+                version: "1.18.1",
+                headline: L10n.t("Add monitoring accounts with the official sign-in."),
+                changes: [
+                    ReleaseNote.Change(title: L10n.t("Sign in, confirm the account, then monitor"),
+                        detail: L10n.t("Add up to two Codex and Claude accounts without choosing folders or changing your normal CLI login.")),
+                    ReleaseNote.Change(title: L10n.t("Each account keeps its own identity and usage"),
+                        detail: L10n.t("Duplicate accounts are rejected. A changed login cannot display the previous account's numbers."))
+                ]
+            ),
+            ReleaseNote(
+                version: "1.18.0",
+                headline: L10n.t("Two accounts, two icons, separate usage readings."),
+                changes: [
+                    ReleaseNote.Change(title: L10n.t("Codex 1 · Codex 2 · Claude 1 · Claude 2"),
+                        detail: L10n.t("Monitor up to two accounts per provider, with numbered icons and distinct shades. Usage and connection status stay separate.")),
+                    ReleaseNote.Change(title: L10n.t("Saved ChatGPT accounts in Aside on Mac"),
+                        detail: L10n.t("Both accounts are read without switching the browser account. Existing Codex and Claude login folders can also be added in Accounts."))
+                ]
+            ),
+            ReleaseNote(
                 version: "1.17.4",
                 headline: L10n.t("Usage percentages keep the time they were measured, and a dropped connection keeps the last reading."),
                 changes: [

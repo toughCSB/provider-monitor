@@ -30,7 +30,7 @@ const BACKOFF_CAP_SECS: u64 = 900;
 const RENEW_MARGIN_MS: u64 = 4 * 60 * 1000;
 const RENEW_COOLDOWN_MS: u64 = 10 * 60 * 1000;
 const RENEW_TIMEOUT_SECS: u64 = 30;
-const EXPIRED_NOTE: &str = "Credential expired — run claude once in a terminal to renew it";
+const EXPIRED_NOTE: &str = "Claude credential expired — automatic renewal pending";
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -110,14 +110,14 @@ fn persist(s: &UsageSnapshot) {
     }
 }
 
-struct Credential {
-    token: String,
+pub(crate) struct Credential {
+    pub(crate) token: String,
     /// ms epoch (None = the file names no expiry)
-    expires_at: Option<u64>,
+    pub(crate) expires_at: Option<u64>,
 }
 
 impl Credential {
-    fn expired(&self, now: u64) -> bool {
+    pub(crate) fn expired(&self, now: u64) -> bool {
         self.expires_at.map(|e| e <= now).unwrap_or(false)
     }
 }
@@ -125,8 +125,12 @@ impl Credential {
 /// Reads Claude Code's OAuth credential.
 fn read_credentials() -> Option<Credential> {
     let home = dirs::home_dir()?;
+    read_credentials_in(&home.join(".claude"))
+}
+
+pub(crate) fn read_credentials_in(dir: &std::path::Path) -> Option<Credential> {
     for name in [".credentials.json", "credentials.json"] {
-        let p = home.join(".claude").join(name);
+        let p = dir.join(name);
         let Ok(text) = std::fs::read_to_string(&p) else {
             continue;
         };
@@ -134,7 +138,7 @@ fn read_credentials() -> Option<Credential> {
             continue;
         };
         let oauth = v.get("claudeAiOauth").unwrap_or(&v);
-        if let Some(tok) = oauth.get("accessToken").and_then(|x| x.as_str()) {
+        if let Some(tok) = oauth.get("accessToken").and_then(|x| x.as_str()).filter(|s| !s.trim().is_empty()) {
             let expires_at = oauth.get("expiresAt").and_then(|x| x.as_f64()).map(|ms| ms as u64);
             return Some(Credential { token: tok.to_string(), expires_at });
         }
@@ -167,7 +171,7 @@ fn is_desktop_owned(p: &std::path::Path) -> bool {
 }
 
 /// The standalone Claude Code command: its own installer's location first, then global npm/pnpm/Volta, then PATH
-fn find_cli() -> Option<std::path::PathBuf> {
+pub(crate) fn find_cli() -> Option<std::path::PathBuf> {
     let mut v = Vec::new();
     if let Some(h) = dirs::home_dir() {
         v.push(h.join(".local").join("bin").join("claude.exe"));
@@ -201,32 +205,25 @@ fn should_renew(expires_at: Option<u64>, now: u64) -> bool {
 /// `claude -p` with a null stdin starts up (which is where it renews an aged token), then exits non-zero for want
 /// of a prompt: no conversation, no transcript. Output goes nowhere — a token could in principle be echoed into it.
 fn run_renewal(cli: &std::path::Path) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new(cli);
-    cmd.arg("-p").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    use std::process::Stdio;
+    let mut cmd = crate::polling::cli_command(cli);
+    cmd.args(["--safe-mode", "--print", "--no-session-persistence", "--strict-mcp-config"])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // Launched from inside a Claude Code session, the child would take the host's auth and leave the file alone
     for (k, _) in std::env::vars_os() {
         let k = k.to_string_lossy();
-        if k == "CLAUDECODE" || k.starts_with("CLAUDE_CODE_") {
+        if k == "CLAUDECODE" || k.starts_with("CLAUDE_") || k.starts_with("ANTHROPIC_") {
             cmd.env_remove(k.as_ref());
         }
     }
+    if let Some(home)=dirs::home_dir() { cmd.env("CLAUDE_CONFIG_DIR",home.join(".claude")); }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     let mut child = cmd.spawn()?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(RENEW_TIMEOUT_SECS);
-    while child.try_wait()?.is_none() {
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
+    crate::polling::wait_for_renewal(&mut child,Duration::from_secs(RENEW_TIMEOUT_SECS))
 }
 
 #[derive(Default)]
@@ -287,7 +284,7 @@ fn label_for(kind: &str) -> String {
     }
 }
 
-fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
+pub(crate) fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
     let mut out: Vec<LimitWindow> = Vec::new();
     if let Some(arr) = v.get("limits").and_then(|x| x.as_array()) {
         for l in arr {

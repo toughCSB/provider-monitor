@@ -69,8 +69,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// any `~/.claude-<slug>` — found once at launch. Each gets a usage
     /// provider and a session monitor of its own, keyed by the same id, so a
     /// work login's sessions spin the work ring and nobody else's.
-    private let claudeProfiles = ClaudeProfile.discover()
-    private let codexProfiles = CodexProfile.discover()
+    private let claudeProfiles = MonitoredAccounts.claude()
+    private let codexProfiles = MonitoredAccounts.codex()
+    private lazy var codexWebAccounts = ChatGPTSavedAccounts.discover()
+    @MainActor private lazy var managedAccountController = ManagedAccountController()
     /// Held as concrete providers, not just handed to the store: the token
     /// refresher needs to ask one of them how long its token has left, and the
     /// protocol has no business carrying that.
@@ -143,13 +145,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // switched-off ones once the binding below delivered.
             Log.usage.info("claude profiles: \(self.claudeProfiles.map(\.displayPath).joined(separator: ", "), privacy: .public)")
             Log.usage.info("codex profiles: \(self.codexProfiles.map(\.displayPath).joined(separator: ", "), privacy: .public)")
-            let claudeProviders = claudeProfiles.map { ClaudeOAuthProvider(profile: $0) }
+            let claudeProviders = managedAccountController.accounts(for: .claude).isEmpty
+                ? claudeProfiles.map { ClaudeOAuthProvider(profile: $0) } : []
             self.claudeProviders = claudeProviders
             let grokProvider = GrokLocalProvider()
             self.grokProvider = grokProvider
-            let allProviders: [UsageProvider] = claudeProviders
+            let claudeSources: [UsageProvider] = claudeProviders.isEmpty
+                ? managedAccountController.providers(for: .claude) : claudeProviders
+            let codexSources: [UsageProvider] = managedAccountController.accounts(for: .codex).isEmpty
+                ? legacyAccountProviders(for: .codex) : managedAccountController.providers(for: .codex)
+            let allProviders: [UsageProvider] = claudeSources
                 + [CursorLocalProvider()]
-                + codexProfiles.map { CodexLocalProvider(profile: $0) }
+                + codexSources
                 + [AntigravityProvider(),
                    GLMProvider(), MiniMaxProvider(web: miniMaxWeb), grokProvider, DevinLocalProvider(), OpenCodeProvider(),
                    CommandCodeProvider(), GitHubCopilotProvider(), KimiProvider(), KiroProvider(),
@@ -173,6 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // order for a frame and then visibly shuffles.
                 order: preferences.providerOrder
             )
+            store.managedAccounts = managedAccountController
             deepSeek.onAuthenticated = { [weak store] in
                 store?.providerAuthenticationChanged(providerID: "deepseek")
             }
@@ -720,7 +728,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             claudeMonitors.append(monitor)
             monitors[profile.id] = monitor
         }
-        for profile in codexProfiles {
+        for profile in codexProfiles where codexWebAccounts.count < 2 {
             monitors[profile.id] = CodexActivityMonitor(profile: profile)
         }
 
@@ -786,14 +794,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.announceCompletions(sessions: fleet.sessions)
         }
         self.activityCoordinator = activity
-        let monitorIDs = Set(monitors.keys)
-        activity.setEnabled(Set(monitorIDs.filter { preferences.isConnected($0) }))
+        activity.setEnabled(Set(activity.knownIDs.filter { preferences.isConnected($0) && (store?.knownIDs.contains($0) ?? false) }))
+        store?.onAccountAdded = { [weak self, weak activity, weak preferences] provider in
+            guard let self, let activity, let preferences else { return }
+            if let codex = provider as? CodexLocalProvider, codex.webAccount == nil {
+                activity.add(CodexActivityMonitor(profile: codex.profile), for: provider.id)
+            } else if let claude = provider as? ClaudeOAuthProvider {
+                let monitor = ClaudeSessionMonitor(directory: claude.profile.sessionsDirectory,
+                                                   projects: claude.profile.projectsDirectory)
+                monitor.ignoredPIDs = { [weak self] in
+                    Set(self?.tokenRefreshers.compactMap(\.launchedPID) ?? [])
+                }
+                activity.add(monitor, for: provider.id)
+                self.claudeProviders.append(claude)
+                let refresher = ClaudeTokenRefresher(expiry: { await claude.tokenExpiry },
+                                                    reload: { await claude.reloadTokenExpiry() },
+                                                    profile: claude.profile)
+                refresher.$outcome.receive(on: RunLoop.main).sink { [weak self] outcome in
+                    if case .failed = outcome { self?.store?.reportRenewalFailed(providerID: provider.id) }
+                    else if case .refreshed = outcome { self?.store?.refresh(providerID: provider.id) }
+                }.store(in: &self.cancellables)
+                self.tokenRefreshers.append(refresher)
+                refresher.start()
+            }
+            preferences.reconcile(discoveredIDs: self.store?.knownIDs ?? [])
+            preferences.setConnected(true, for: provider.id)
+            activity.setEnabled(Set(activity.knownIDs.filter { preferences.isConnected($0) && (self.store?.knownIDs.contains($0) ?? false) }))
+        }
+        managedAccountController.onChanged = { [weak self, weak activity, weak preferences] family in
+            guard let self, let store = self.store, let activity, let preferences else { return }
+            let registered = self.managedAccountController.providers(for: family)
+            let replacements = registered.isEmpty ? self.legacyAccountProviders(for: family) : registered
+            let previouslyHidden = replacements.map(\.id).filter { !preferences.isConnected($0) }
+            if family == .claude {
+                self.tokenRefreshers.forEach { $0.stop() }
+                self.tokenRefreshers.removeAll()
+                self.claudeProviders.removeAll()
+            }
+            store.replaceFamily(family, with: replacements)
+            preferences.reconcile(discoveredIDs: store.knownIDs)
+            store.disconnected = preferences.disconnectedIDs(among: store.knownIDs)
+            if registered.isEmpty {
+                for provider in replacements { store.onAccountAdded?(provider) }
+                for id in previouslyHidden { preferences.setConnected(false, for: id) }
+                store.disconnected = preferences.disconnectedIDs(among: store.knownIDs)
+            }
+            activity.setEnabled(Set(activity.knownIDs.filter { preferences.isConnected($0) && store.knownIDs.contains($0) }))
+        }
         preferences.$connectedProviders
             .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { [weak activity, weak preferences] _ in
+            .sink { [weak self, weak activity, weak preferences] _ in
                 guard let preferences else { return }
-                activity?.setEnabled(Set(monitorIDs.filter { preferences.isConnected($0) }))
+                guard let activity else { return }
+                activity.setEnabled(Set(activity.knownIDs.filter { preferences.isConnected($0) && (self?.store?.knownIDs.contains($0) ?? false) }))
             }
             .store(in: &cancellables)
         store?.isBusy = { [weak self, weak activity] in
@@ -998,6 +1052,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor func openSettings() { settings?.show() }
+    private func legacyAccountProviders(for family: MonitoredAccounts.Family) -> [UsageProvider] {
+        switch family {
+        case .claude:
+            return MonitoredAccounts.claude().map { ClaudeOAuthProvider(profile: $0) }
+        case .codex:
+            let web = ChatGPTSavedAccounts.discover()
+            return web.count >= 2 ? web.map { CodexLocalProvider(webAccount: $0) }
+                : MonitoredAccounts.codex().map { CodexLocalProvider(profile: $0) }
+        }
+    }
     @MainActor func openConnectPhone() {
         guard PhoneLink.isAvailable, let pairing = phoneLinkPairing, let registry = phoneLinkRegistry, let status = phoneLinkServerStatus else { return }
         if preferences?.phoneLinkEnabled == false { preferences?.phoneLinkEnabled = true }
@@ -1005,6 +1069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        managedAccountController.cancel()
         ollamaRelay?.configure(enabled: false, endpoint: OllamaEndpoint.defaultAddress)
         lmstudioMetrics?.stop()
         tokenRefreshers.forEach { $0.stop() }

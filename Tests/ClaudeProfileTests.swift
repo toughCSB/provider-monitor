@@ -270,7 +270,8 @@ final class ClaudeProfileTests: XCTestCase {
             archive: UsageArchive(defaults: defaults)
         )
         XCTAssertEqual(store.snapshots.map(\.id), ["claude", "claude-work"])
-        XCTAssertEqual(store.snapshots.map(\.displayName), ["Claude", "Claude (work)"])
-        XCTAssertEqual(store.providerSummaries.map(\.name), ["Claude", "Claude (work)"])
+        XCTAssertEqual(store.snapshots.map(\.displayName), ["Claude 1", "Claude 2"])
+        XCTAssertEqual(store.providerSummaries.map(\.name), ["Claude 1", "Claude 2"])
+        XCTAssertEqual(store.notchSnapshots.map(\.accountNumber), [1, 2])
     }
 }

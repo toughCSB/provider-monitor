@@ -7,7 +7,11 @@ actor CodexLocalProvider: UsageProvider {
     nonisolated let displayName: String
     nonisolated let glyph = ProviderGlyph.openai
     nonisolated let profile: CodexProfile
-    nonisolated var usageAccountID: String? { CodexCredentials.usageAccountID(from: authURL) }
+    nonisolated var usageAccountID: String? {
+        if let webAccount { return webAccount.identity }
+        return CodexCredentials.usageAccountID(from: authURL)
+    }
+    nonisolated let webAccount: ChatGPTSavedAccount?
 
     private let session: URLSession
     nonisolated private let authURL: URL
@@ -17,24 +21,28 @@ actor CodexLocalProvider: UsageProvider {
     init(profile: CodexProfile = .default(),
          session: URLSession = .shared,
          authURL: URL? = nil,
-         archive: UsageArchive = UsageArchive()) {
+         archive: UsageArchive = UsageArchive(),
+         webAccount: ChatGPTSavedAccount? = nil) {
         self.profile = profile
-        self.id = profile.id
-        self.displayName = profile.displayName
-        self.session = session
+        self.webAccount = webAccount
+        self.id = webAccount?.providerID ?? profile.id
+        self.displayName = webAccount == nil ? profile.displayName : "Codex"
+        self.session = webAccount == nil ? session : CodexSessionRedirectPolicy.session()
         self.authURL = authURL ?? profile.authURL
         self.archive = archive
         // Recreating the provider or relaunching must not bypass the server's retry deadline.
-        self.retryNoEarlierThan = archive.loadBackoffUntil(providerID: profile.id)
+        self.retryNoEarlierThan = archive.loadBackoffUntil(providerID: webAccount?.providerID ?? profile.id)
     }
 
     nonisolated var signInRoute: SignInRoute {
+        if webAccount != nil { return .openApp(bundleID: "at.studio.AsideBrowser", name: "Aside") }
         guard profile.slug != nil else { return .openApp(bundleID: "com.openai.codex", name: "Codex") }
         return .guidance(L10n.t("Run \(profile.signInCommand) in Terminal to sign in to \(displayName)."))
     }
 
     nonisolated func account() -> ProviderAccount? {
-        CodexCredentials.account(from: authURL, source: profile.sourceName)
+        if let webAccount { return webAccount.account }
+        return CodexCredentials.account(from: authURL, source: profile.sourceName)
     }
 
     func fetchSnapshot() async throws -> ProviderSnapshot {
@@ -44,7 +52,15 @@ actor CodexLocalProvider: UsageProvider {
         }
 
         // Codex can rotate its token between polls; this app never refreshes or writes it.
-        let credential = try CodexCredentials.load(from: authURL)
+        let credential: CodexCredentials.Credential
+        do {
+            if let webAccount { credential = try await webAccount.credential(session: session) }
+            else { credential = try CodexCredentials.load(from: authURL) }
+        } catch UsageProviderError.rateLimited(let delay) {
+            retryNoEarlierThan = Date().addingTimeInterval(delay)
+            archive.saveBackoffUntil(retryNoEarlierThan, providerID: id)
+            throw UsageProviderError.rateLimited(retryAfter: delay)
+        }
         var request = URLRequest(
             url: URL(string: "https://chatgpt.com/backend-api/wham/usage")!,
             cachePolicy: .reloadIgnoringLocalCacheData,
@@ -155,7 +171,7 @@ actor CodexLocalProvider: UsageProvider {
         }
     }
 
-    private static func retryAfter(from response: HTTPURLResponse?, now: Date) -> TimeInterval? {
+    static func retryAfter(from response: HTTPURLResponse?, now: Date) -> TimeInterval? {
         UsageRetryPolicy.retryAfter(from: response, at: now)
     }
 }
