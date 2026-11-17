@@ -611,11 +611,13 @@ fn cap(s: &str) -> String {
     }
 }
 
-fn broadcast(app: &AppHandle, snap: UsageSnapshot) {
-    let st = app.state::<AppState>();
-    *st.codex.lock().unwrap() = snap.clone();
-    persist(&snap);
-    let _ = app.emit("codex", &snap);
+fn broadcast(app: &AppHandle, generation: u64, snap: UsageSnapshot) {
+    crate::managed::with_legacy_source(app, "codex", generation, || {
+        let st = app.state::<AppState>();
+        *st.codex.lock().unwrap() = snap.clone();
+        persist(&snap);
+        let _ = app.emit("codex", &snap);
+    });
 }
 
 pub fn start(app: AppHandle) {
@@ -623,10 +625,10 @@ pub fn start(app: AppHandle) {
         {
             let st = app.state::<AppState>();
             let snap = st.codex.lock().unwrap().clone();
-            let _ = app.emit("codex", &snap);
+            if !crate::managed::has_provider(&app, "codex") { let _ = app.emit("codex", &snap); }
         }
         if !present() {
-            broadcast(&app, UsageSnapshot { status: "absent".into(), ..Default::default() });
+            broadcast(&app, crate::managed::generation("codex"), UsageSnapshot { status: "absent".into(), ..Default::default() });
             // Codex is not installed: look again every 10 minutes
             loop {
                 for _ in 0..600 {
@@ -643,6 +645,14 @@ pub fn start(app: AppHandle) {
         let mut last_identity: Option<String> = None;
         let mut has_live_for_identity = false;
         loop {
+            let generation = crate::managed::generation("codex");
+            if crate::managed::has_provider(&app, "codex") {
+                for _ in 0..30 {
+                    if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) { break; }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                continue;
+            }
             let credential = load_credential();
             let identity = credential.as_ref().map(|c| c.account_id.clone());
             let same_identity = identity.is_some() && identity == last_identity;
@@ -656,7 +666,7 @@ pub fn start(app: AppHandle) {
             let (snap, live_success) = read_once(&previous, credential, same_identity && has_live_for_identity);
             has_live_for_identity |= live_success;
             let deadline = snap.backoff_until;
-            broadcast(&app, snap);
+            broadcast(&app, generation, snap);
             for _ in 0..crate::polling::poll_wait_secs(POLL_SECS, deadline, now_ms()) {
                 if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     break;

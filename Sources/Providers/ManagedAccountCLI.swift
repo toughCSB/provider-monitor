@@ -19,13 +19,13 @@ enum ManagedCLIError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .unavailable: return "The official CLI is not installed."
-        case .notSignedIn: return "This account is not signed in."
-        case .invalidResponse: return "The official CLI returned an unreadable response."
-        case .identityChanged: return "The signed-in account changed during the request."
-        case .failed: return "The official CLI request failed."
-        case .timedOut: return "The official CLI request timed out."
-        case .cancelled: return "The official CLI request was cancelled."
+        case .unavailable: return L10n.t("The official CLI is not installed.")
+        case .notSignedIn: return L10n.t("This account is not signed in.")
+        case .invalidResponse: return L10n.t("The official CLI returned an unreadable response.")
+        case .identityChanged: return L10n.t("The signed-in account changed during the request.")
+        case .failed: return L10n.t("The official CLI request failed.")
+        case .timedOut: return L10n.t("The official CLI request timed out.")
+        case .cancelled: return L10n.t("The official CLI request was cancelled.")
         }
     }
 }
@@ -37,6 +37,7 @@ final class ManagedCLICancellation: @unchecked Sendable {
     private var reason: ManagedCLIError?
 
     func cancel() { stop(.cancelled) }
+    fileprivate func expire() { stop(.timedOut) }
 
     fileprivate func install(_ child: Process) throws {
         lock.lock()
@@ -53,10 +54,7 @@ final class ManagedCLICancellation: @unchecked Sendable {
     }
 
     fileprivate func timeout(_ child: Process) {
-        lock.lock()
-        let active = process === child && reason == nil
-        lock.unlock()
-        if active { stop(.timedOut) }
+        stop(.timedOut, expected: child)
     }
 
     fileprivate var currentReason: ManagedCLIError? {
@@ -65,8 +63,9 @@ final class ManagedCLICancellation: @unchecked Sendable {
         return reason
     }
 
-    private func stop(_ why: ManagedCLIError) {
+    private func stop(_ why: ManagedCLIError, expected: Process? = nil) {
         lock.lock()
+        if let expected, process !== expected { lock.unlock(); return }
         if reason != nil { lock.unlock(); return }
         reason = why
         let child = process
@@ -90,25 +89,52 @@ enum ManagedAccountCLI {
     @TaskLocal static var claudeBinaryOverride: URL?
     @TaskLocal static var timeoutOverride: TimeInterval?
 
+    /// One budget includes every identity check and the usage command. A slow
+    /// stage must not silently buy the following stage a fresh full deadline.
+    private static func attempt<T>(timeout: TimeInterval, cancellation: ManagedCLICancellation,
+                                   operation: () async throws -> T) async throws -> T {
+        let seconds = timeoutOverride ?? timeout
+        let watchdog = Task.detached {
+            do { try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000)) }
+            catch { return }
+            cancellation.expire()
+        }
+        defer { watchdog.cancel() }
+        return try await withTaskCancellationHandler {
+            try await operation()
+        } onCancel: { cancellation.cancel() }
+    }
+
     static func login(family: MonitoredAccounts.Family, home: URL,
                       cancellation: ManagedCLICancellation) async throws -> ManagedCLIIdentity {
         let binary = try locate(family)
         let arguments = family == .codex
             ? ["-c", "cli_auth_credentials_store=\"file\"", "login"]
             : ["auth", "login", "--claudeai"]
-        _ = try await run(binary: binary, arguments: arguments, family: family, home: home,
-                          cancellation: cancellation, timeout: 300)
-        if let stopped = cancellation.currentReason { throw stopped }
-        let signedIn = try await identity(family: family, home: home)
-        if let stopped = cancellation.currentReason { throw stopped }
-        return signedIn
+        return try await attempt(timeout: 300, cancellation: cancellation) {
+            _ = try await run(binary: binary, arguments: arguments, family: family, home: home,
+                              cancellation: cancellation, timeout: 300)
+            if let stopped = cancellation.currentReason { throw stopped }
+            let signedIn = try await identity(family: family, home: home, cancellation: cancellation)
+            if let stopped = cancellation.currentReason { throw stopped }
+            return signedIn
+        }
     }
 
-    static func identity(family: MonitoredAccounts.Family, home: URL) async throws -> ManagedCLIIdentity {
+    static func identity(family: MonitoredAccounts.Family, home: URL,
+                         cancellation: ManagedCLICancellation = ManagedCLICancellation()) async throws -> ManagedCLIIdentity {
+        try await attempt(timeout: 30, cancellation: cancellation) {
+            try await readIdentity(family: family, home: home, cancellation: cancellation)
+        }
+    }
+
+    private static func readIdentity(family: MonitoredAccounts.Family, home: URL,
+                                     cancellation: ManagedCLICancellation) async throws -> ManagedCLIIdentity {
+        if let stopped = cancellation.currentReason { throw stopped }
         switch family {
         case .codex:
             let claims = try codexClaims(home: home)
-            let rpc = try await codexRPC(home: home, methods: ["account/read"])
+            let rpc = try await codexRPC(home: home, methods: ["account/read"], cancellation: cancellation)
             guard let account = rpc[1]?["account"] as? [String: Any],
                   account["type"] as? String == "chatgpt",
                   let rpcEmail = clean(account["email"] as? String),
@@ -121,42 +147,61 @@ enum ManagedAccountCLI {
                   claims.email.caseInsensitiveCompare(after.email) == .orderedSame else {
                 throw ManagedCLIError.identityChanged
             }
+            if let stopped = cancellation.currentReason { throw stopped }
             return ManagedCLIIdentity(subject: claims.subject, email: claims.email,
                                       workspaceID: claims.workspaceID,
                                       plan: clean(account["planType"] as? String) ?? claims.plan)
         case .claude:
             let result = try await run(binary: locate(.claude), arguments: ["auth", "status"], family: .claude,
-                                       home: home, cancellation: ManagedCLICancellation(), timeout: 20,
+                                       home: home, cancellation: cancellation, timeout: 20,
                                        acceptedExitCodes: [0, 1])
+            if let stopped = cancellation.currentReason { throw stopped }
             return try claudeIdentity(result, home: home)
         }
     }
 
     static func usage(family: MonitoredAccounts.Family, home: URL,
                       expected: ManagedCLIIdentity) async throws -> (windows: [LimitWindow], plan: String?) {
-        let before = try await identity(family: family, home: home)
-        guard before.key == expected.key else { throw ManagedCLIError.identityChanged }
-        let windows: [LimitWindow]
-        let plan: String?
-        switch family {
-        case .codex:
-            let rpc = try await codexRPC(home: home, methods: ["account/read", "account/rateLimits/read"])
-            guard let account = rpc[1]?["account"] as? [String: Any],
-                  (account["email"] as? String)?.caseInsensitiveCompare(expected.email) == .orderedSame else {
-                throw ManagedCLIError.identityChanged
-            }
-            windows = try parseCodexLimits(rpc[2] ?? [:])
-            plan = clean(account["planType"] as? String) ?? before.plan
-        case .claude:
-            let data = try await run(binary: locate(.claude),
-                                     arguments: ["--safe-mode"] + ClaudeUsageCLI.arguments, family: .claude,
-                                     home: home, cancellation: ManagedCLICancellation(), timeout: 30)
-            guard let output = String(data: data, encoding: .utf8) else { throw ManagedCLIError.invalidResponse }
-            windows = try ClaudeUsageCLI.parse(output, now: Date())
-            plan = ClaudeUsageCLI.plan(in: output) ?? before.plan
+        let cancellation = ManagedCLICancellation()
+        return try await attempt(timeout: 30, cancellation: cancellation) {
+            try await readUsage(family: family, home: home, expected: expected, cancellation: cancellation)
         }
-        let after = try await identity(family: family, home: home)
+    }
+
+    private static func readUsage(family: MonitoredAccounts.Family, home: URL,
+                                  expected: ManagedCLIIdentity, cancellation: ManagedCLICancellation)
+        async throws -> (windows: [LimitWindow], plan: String?) {
+        if let stopped = cancellation.currentReason { throw stopped }
+        if family == .codex {
+            let before = try codexClaims(home: home)
+            guard before.key == expected.key, before.email.caseInsensitiveCompare(expected.email) == .orderedSame
+            else { throw ManagedCLIError.identityChanged }
+            let rpc = try await codexRPC(home: home,
+                                         methods: ["account/read", "account/rateLimits/read", "account/read"],
+                                         cancellation: cancellation, expectedEmail: expected.email)
+            let after = try codexClaims(home: home)
+            guard after.key == expected.key, after.email.caseInsensitiveCompare(expected.email) == .orderedSame,
+                  let first = rpc[1]?["account"] as? [String: Any],
+                  let last = rpc[3]?["account"] as? [String: Any],
+                  [first, last].allSatisfy({ account in
+                      account["type"] as? String == "chatgpt" &&
+                      (account["email"] as? String)?.caseInsensitiveCompare(expected.email) == .orderedSame
+                  }) else { throw ManagedCLIError.identityChanged }
+            let windows = try parseCodexLimits(rpc[2] ?? [:])
+            if let stopped = cancellation.currentReason { throw stopped }
+            return (windows, clean(last["planType"] as? String) ?? after.plan ?? expected.plan)
+        }
+        let before = try await readIdentity(family: family, home: home, cancellation: cancellation)
+        guard before.key == expected.key else { throw ManagedCLIError.identityChanged }
+        let data = try await run(binary: locate(.claude),
+                                 arguments: ["--safe-mode"] + ClaudeUsageCLI.arguments, family: .claude,
+                                 home: home, cancellation: cancellation, timeout: 30)
+        guard let output = String(data: data, encoding: .utf8) else { throw ManagedCLIError.invalidResponse }
+        let windows = try ClaudeUsageCLI.parse(output, now: Date())
+        let plan = ClaudeUsageCLI.plan(in: output) ?? before.plan
+        let after = try await readIdentity(family: family, home: home, cancellation: cancellation)
         guard after.key == expected.key else { throw ManagedCLIError.identityChanged }
+        if let stopped = cancellation.currentReason { throw stopped }
         return (windows, plan)
     }
 
@@ -254,11 +299,13 @@ enum ManagedAccountCLI {
         return URL(fileURLWithPath: binary)
     }
 
-    private static func codexRPC(home: URL, methods: [String]) async throws -> [Int: [String: Any]] {
+    private static func codexRPC(home: URL, methods: [String],
+                                 cancellation: ManagedCLICancellation,
+                                 expectedEmail: String? = nil) async throws -> [Int: [String: Any]] {
         let binary = try locate(.codex)
         let data = try await run(binary: binary, arguments: ["app-server", "--listen", "stdio://"], family: .codex,
-                                 home: home, cancellation: ManagedCLICancellation(), timeout: 30,
-                                 rpcMethods: methods)
+                                 home: home, cancellation: cancellation, timeout: 30,
+                                 rpcMethods: methods, expectedEmail: expectedEmail)
         var replies: [Int: [String: Any]] = [:]
         for line in data.split(separator: 10) {
             guard let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
@@ -284,7 +331,8 @@ enum ManagedAccountCLI {
 
     private static func run(binary: URL, arguments: [String], family: MonitoredAccounts.Family, home: URL,
                             cancellation: ManagedCLICancellation, timeout: TimeInterval,
-                            rpcMethods: [String] = [], acceptedExitCodes: Set<Int32> = [0]) async throws -> Data {
+                            rpcMethods: [String] = [], expectedEmail: String? = nil,
+                            acceptedExitCodes: Set<Int32> = [0]) async throws -> Data {
         let deadline = timeoutOverride ?? timeout
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
@@ -316,7 +364,7 @@ enum ManagedAccountCLI {
                         input.fileHandleForWriting.write(Data(initialize.utf8))
                     }
                     var collected = Data(), pending = Data(), received = Set<Int>()
-                    var sentRequests = false, complete = false, overflow = false
+                    var sentRequests = false, complete = false, overflow = false, identityMismatch = false
                     while true {
                         let chunk = output.fileHandleForReading.availableData
                         if chunk.isEmpty { break }
@@ -336,13 +384,29 @@ enum ManagedAccountCLI {
                                 if id == 0 && !sentRequests && message["result"] != nil {
                                     sentRequests = true
                                     var requests = Data("{\"method\":\"initialized\",\"params\":{}}\n".utf8)
-                                    for (index, method) in rpcMethods.enumerated() {
-                                        let params = method == "account/read" ? ",\"params\":{\"refreshToken\":false}" : ""
-                                        requests.append(Data("{\"method\":\"\(method)\",\"id\":\(index + 1)\(params)}\n".utf8))
-                                    }
+                                    let first = rpcMethods[0]
+                                    let params = first == "account/read" ? ",\"params\":{\"refreshToken\":false}" : ""
+                                    requests.append(Data("{\"method\":\"\(first)\",\"id\":1\(params)}\n".utf8))
                                     input.fileHandleForWriting.write(requests)
-                                } else if id > 0 { received.insert(id) }
+                                } else if id > 0 && id <= rpcMethods.count && received.insert(id).inserted {
+                                    if id == 1, let expectedEmail {
+                                        let account = (message["result"] as? [String: Any])?["account"] as? [String: Any]
+                                        if account?["type"] as? String != "chatgpt" ||
+                                            (account?["email"] as? String)?.caseInsensitiveCompare(expectedEmail) != .orderedSame {
+                                            identityMismatch = true
+                                            try? input.fileHandleForWriting.close()
+                                            if process.isRunning { process.terminate() }
+                                            break
+                                        }
+                                    }
+                                    if id < rpcMethods.count {
+                                        let next = rpcMethods[id]
+                                        let params = next == "account/read" ? ",\"params\":{\"refreshToken\":false}" : ""
+                                        input.fileHandleForWriting.write(Data("{\"method\":\"\(next)\",\"id\":\(id + 1)\(params)}\n".utf8))
+                                    }
+                                }
                             }
+                            if identityMismatch { break }
                             if received.count == rpcMethods.count {
                                 complete = true
                                 try? input.fileHandleForWriting.close()
@@ -354,6 +418,7 @@ enum ManagedAccountCLI {
                     process.waitUntilExit()
                     let stopped = cancellation.finish(process)
                     if let stopped { throw stopped }
+                    if identityMismatch { throw ManagedCLIError.identityChanged }
                     if overflow { throw ManagedCLIError.invalidResponse }
                     if !rpcMethods.isEmpty && !complete { throw ManagedCLIError.invalidResponse }
                     if rpcMethods.isEmpty && !acceptedExitCodes.contains(process.terminationStatus) {

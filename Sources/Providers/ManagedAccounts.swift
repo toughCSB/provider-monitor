@@ -24,7 +24,7 @@ final class ManagedAccountController: ObservableObject {
     }
 
     typealias Login = @Sendable (MonitoredAccounts.Family, URL, ManagedCLICancellation) async throws -> ManagedCLIIdentity
-    typealias IdentityReader = @Sendable (MonitoredAccounts.Family, URL) async throws -> ManagedCLIIdentity
+    typealias IdentityReader = @Sendable (MonitoredAccounts.Family, URL, ManagedCLICancellation) async throws -> ManagedCLIIdentity
 
     @Published private(set) var records: [ManagedAccountRecord] = []
     @Published private(set) var busyFamily: MonitoredAccounts.Family?
@@ -39,6 +39,7 @@ final class ManagedAccountController: ObservableObject {
     private let readIdentity: IdentityReader
     private var generation: UUID?
     private var cancellation: ManagedCLICancellation?
+    private var confirmationCancellation: ManagedCLICancellation?
     private var task: Task<Void, Never>?
     private var corruptRegistry = false
     private static let key = "managedMonitoringAccounts.v1"
@@ -50,7 +51,7 @@ final class ManagedAccountController: ObservableObject {
 
     init(defaults: UserDefaults = .standard, root: URL = defaultRoot,
          login: @escaping Login = { try await ManagedAccountCLI.login(family: $0, home: $1, cancellation: $2) },
-         readIdentity: @escaping IdentityReader = { try await ManagedAccountCLI.identity(family: $0, home: $1) }) {
+         readIdentity: @escaping IdentityReader = { try await ManagedAccountCLI.identity(family: $0, home: $1, cancellation: $2) }) {
         self.defaults = defaults
         self.root = root.standardizedFileURL
         self.login = login
@@ -155,6 +156,8 @@ final class ManagedAccountController: ObservableObject {
         generation = nil
         cancellation?.cancel()
         cancellation = nil
+        confirmationCancellation?.cancel()
+        confirmationCancellation = nil
         task?.cancel()
         task = nil
         busyFamily = nil
@@ -166,10 +169,14 @@ final class ManagedAccountController: ObservableObject {
     func confirm() async {
         guard let pending, !isConfirming, !corruptRegistry else { return }
         isConfirming = true
-        defer { isConfirming = false }
+        let cancellation = ManagedCLICancellation()
+        confirmationCancellation = cancellation
+        defer { isConfirming = false; confirmationCancellation = nil }
         do {
             // Recheck after the user read the identity: a changed home cannot be registered.
-            let current = try await readIdentity(pending.family, pending.home)
+            let current = try await withTaskCancellationHandler {
+                try await readIdentity(pending.family, pending.home, cancellation)
+            } onCancel: { cancellation.cancel() }
             guard self.pending?.id == pending.id, !Task.isCancelled else { return }
             guard current.key == pending.identity.key else { throw UsageProviderError.accountChanged }
             var next = records
@@ -197,6 +204,7 @@ final class ManagedAccountController: ObservableObject {
             errorMessage = nil
             onChanged?(pending.family)
         } catch {
+            guard self.pending?.id == pending.id else { return }
             errorMessage = L10n.t("The account could not be confirmed. Your existing accounts have been preserved.")
         }
     }

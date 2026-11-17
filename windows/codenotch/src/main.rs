@@ -44,7 +44,7 @@ pub const NOTCH_W: f64 = 360.0;
 /// A simple 360×700 rotation clipped the bottom of cards because the card begins beyond the body.
 pub const HORIZONTAL_NOTCH_H: f64 = 700.0;
 /// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r46-session-recovery-and-time-labels";
+pub const BUILD: &str = "r47-account-source-and-quota-stability";
 // The macOS geometry is 526 pt tall for five provider cells before a hover card is considered.
 // 700 leaves the same end slack the native panel keeps, so the first/last card can stay wholly on
 // screen without shrinking the rings or folding the spacing back toward the old Windows design.
@@ -1174,6 +1174,9 @@ fn ring_window<'a>(
     // Antigravity keeps its own model-family filtering; antigravity_lane already understands
     // "automatic" plus every explicit limit, so it takes the whole decision by itself.
     if provider == "gemini" {
+        if windows.len() == 1 && windows[0].id == "requests" && windows[0].count.is_some() {
+            return windows.first();
+        }
         return antigravity_lane(windows, ring_limit, antigravity_model);
     }
     let default = provider_default(provider, windows);
@@ -1191,7 +1194,7 @@ fn ring_window<'a>(
 }
 
 /// Antigravity's lane, chosen as the Mac app's "Notch reads" and "Model data" choose it: within the
-/// model family (or every lane, if none belongs to it), the tightest lane of the chosen cadence; on
+/// model family, the tightest lane of the chosen cadence; on
 /// Automatic, the tightest lane that still has room, or the tightest of all once every one is spent.
 fn antigravity_lane<'a>(
     windows: &'a [usage::LimitWindow],
@@ -1199,7 +1202,7 @@ fn antigravity_lane<'a>(
     model: &str,
 ) -> Option<&'a usage::LimitWindow> {
     let family: Vec<_> = windows.iter().filter(|w| lane_family(w) == model).collect();
-    let lanes = if family.is_empty() { windows.iter().collect() } else { family };
+    let lanes = family;
     if limit != "automatic" {
         if let Some(w) = tightest(lanes.iter().copied().filter(|w| lane_is(w, limit))) {
             return Some(w);
@@ -2302,6 +2305,8 @@ mod tests {
     fn antigravity_reads_only_gemini_lanes_unless_told_otherwise() {
         assert_eq!(lane(&bridge(), "automatic", "gemini"), Some("gemini-weekly"));
         assert_eq!(lane(&bridge(), "automatic", "3p"), Some("3p-5h"));
+        assert_eq!(lane(&[win("3p-weekly", 0.9)], "automatic", "gemini"), None);
+        assert_eq!(lane(&[win("gemini-weekly", 0.2)], "5h", "3p"), None);
     }
 
     #[test]

@@ -292,6 +292,41 @@ final class GrokTokenRefresherTests: XCTestCase {
         XCTAssertEqual(spy.launches, 1)
     }
 
+    func testStopWhileExpiryIsPendingPreventsAnOldSourceFromLaunching() async {
+        let spy = Spy()
+        let gate = AsyncGate()
+        let refresher = GrokTokenRefresher(
+            expiry: { await gate.wait(); return self.inSeconds(-60) },
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/grok"),
+            launcher: { _, _ in spy.launches += 1; return (4242, { 0 }) }
+        )
+        let task = Task { await refresher.considerRenewing(now: now) }
+        while !refresher.isRunningForTesting { await Task.yield() }
+        refresher.stop()
+        gate.open()
+        await task.value
+        XCTAssertEqual(spy.launches, 0)
+        XCTAssertEqual(refresher.outcome, .idle)
+    }
+
+    func testStopWhileRenewalIsInFlightCannotPublishOldOutcome() async {
+        let gate = AsyncGate()
+        let stub = Stub(inSeconds(-60))
+        let refresher = GrokTokenRefresher(
+            expiry: { stub.value }, cli: URL(fileURLWithPath: "/opt/homebrew/bin/grok"),
+            launcher: { _, _ in
+                stub.value = self.inSeconds(6 * 3600)
+                return (4242, { await gate.wait(); return 0 })
+            }
+        )
+        let task = Task { await refresher.considerRenewing(now: now) }
+        while refresher.launchedPID == nil { await Task.yield() }
+        refresher.stop()
+        gate.open()
+        await task.value
+        XCTAssertEqual(refresher.outcome, .idle)
+    }
+
     func testTheRenewalRunAsksTheCliToReauthenticateHeadlessly() {
         XCTAssertEqual(GrokTokenRefresher.arguments, ["agent", "--reauth", "stdio"])
     }
@@ -315,6 +350,19 @@ final class GrokTokenRefresherTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(start), 3)
         XCTAssertEqual(kill(pid, 0), -1, "the pid must not still exist once wait() has returned")
         XCTAssertEqual(errno, ESRCH, "specifically gone, not merely unreachable for some other reason")
+    }
+
+    func testCancellingRenewalWaitKillsOnlyItsProcess() async throws {
+        let stubborn = try makeStubbornScript()
+        defer { try? FileManager.default.removeItem(at: stubborn) }
+        let (pid, exit) = try GrokTokenRefresher.run(stubborn, timeout: 30)
+        let task = Task { await exit() }
+        try await Task.sleep(for: .milliseconds(100))
+        task.cancel()
+        let status = await task.value
+        XCTAssertNil(status)
+        XCTAssertEqual(kill(pid, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
     }
 
     func testRenewalDoesNotSendEOFBeforeAuthenticationCanFinish() async throws {

@@ -26,6 +26,27 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 static PENDING: OnceLock<Mutex<HashMap<String, Pending>>> = OnceLock::new();
 static REFRESH: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static PERSIST_LOCK: Mutex<()> = Mutex::new(());
+static CODEX_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CLAUDE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn generation_counter(provider: &str) -> &'static AtomicU64 {
+    if provider == "codex" { &CODEX_GENERATION } else { &CLAUDE_GENERATION }
+}
+pub fn generation(provider: &str) -> u64 {
+    generation_counter(provider).load(Ordering::Acquire)
+}
+pub fn with_legacy_source<R>(app: &AppHandle, provider: &str, expected: u64, publish: impl FnOnce() -> R) -> Option<R> {
+    let st = app.state::<AppState>();
+    let cfg = st.cfg.lock().unwrap();
+    if !legacy_source_allowed(&cfg.managed_accounts, provider, expected, generation(provider)) {
+        return None;
+    }
+    Some(publish())
+}
+
+fn legacy_source_allowed(accounts: &[ManagedAccount], provider: &str, expected: u64, current: u64) -> bool {
+    expected == current && !accounts.iter().any(|a| a.provider == provider && valid(&a.provider, a.slot))
+}
 
 fn pending() -> &'static Mutex<HashMap<String, Pending>> {
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
@@ -332,6 +353,10 @@ fn claude_usage(dir: &Path) -> Result<Vec<LimitWindow>, String> {
 }
 
 fn parse_claude_usage(text: &str) -> Result<Vec<LimitWindow>, String> {
+    parse_claude_usage_at(text, chrono::Utc::now())
+}
+
+fn parse_claude_usage_at(text: &str, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<LimitWindow>, String> {
     let mut windows = Vec::new();
     for line in text.lines() {
         let Some((head, body)) = line.trim().split_once(':') else {
@@ -352,7 +377,7 @@ fn parse_claude_usage(text: &str) -> Result<Vec<LimitWindow>, String> {
         } else {
             continue;
         };
-        let Some((percent, _)) = body.trim().split_once("% used") else {
+        let Some((percent, rest)) = body.trim().split_once("% used") else {
             continue;
         };
         let Ok(value) = percent.trim().parse::<f64>() else {
@@ -377,14 +402,70 @@ fn parse_claude_usage(text: &str) -> Result<Vec<LimitWindow>, String> {
             id: kind,
             label,
             used: value / 100.0,
+            resets_at: rest.trim().strip_prefix('·').map(str::trim)
+                .and_then(|s| s.strip_prefix("resets "))
+                .and_then(|s| parse_claude_reset(s, now)),
             ..Default::default()
         });
     }
-    if !windows.iter().any(|w| w.id == "session") {
-        return Err("Claude /usage did not return a session limit".into());
+    if windows.is_empty() {
+        return Err("Claude /usage did not return a usage limit".into());
     }
     windows.sort_by_key(|w| if w.id == "session" { 0 } else { 1 });
     Ok(windows)
+}
+
+fn parse_claude_reset(text: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    use chrono::{Datelike, NaiveDate, NaiveTime, TimeZone};
+    if let Ok(date) = chrono::DateTime::parse_from_rfc3339(text.trim()) {
+        return u64::try_from(date.timestamp_millis()).ok();
+    }
+    let (date_time, zone) = text.trim().rsplit_once(" (")?;
+    let zone = zone.strip_suffix(')')?;
+    // The CLI prints IANA names without offsets. Only zones whose offset is unambiguous
+    // throughout the year can be converted without a timezone database.
+    let seconds = match zone {
+        "UTC" | "Etc/UTC" => 0,
+        "Asia/Seoul" | "Asia/Tokyo" => 9 * 3600,
+        "Asia/Jakarta" | "Asia/Bangkok" => 7 * 3600,
+        "Asia/Singapore" => 8 * 3600,
+        _ => return None,
+    };
+    let offset = chrono::FixedOffset::east_opt(seconds)?;
+    let (date, clock) = date_time.split_once(" at ")?;
+    let mut clock_text = clock.trim().to_ascii_lowercase();
+    if !clock_text.contains(':') {
+        for suffix in ["am", "pm"] {
+            if let Some(hour) = clock_text.strip_suffix(suffix) {
+                clock_text = format!("{}:00{suffix}", hour.trim());
+                break;
+            }
+        }
+    }
+    let clock = NaiveTime::parse_from_str(&clock_text, "%I:%M%P")
+        .or_else(|_| NaiveTime::parse_from_str(&clock_text, "%I:%M %P"))
+        .or_else(|_| NaiveTime::parse_from_str(&clock_text, "%I%P"))
+        .or_else(|_| NaiveTime::parse_from_str(&clock_text, "%I %P"))
+        .or_else(|_| NaiveTime::parse_from_str(&clock_text, "%H:%M"))
+        .ok()?;
+    let parts: Vec<_> = date.trim().replace(',', "").split_whitespace().map(String::from).collect();
+    if !(2..=3).contains(&parts.len()) { return None; }
+    let month = chrono::NaiveDate::parse_from_str(&format!("{} 1 2000", parts[0]), "%b %d %Y").ok()?.month();
+    let day = parts[1].parse::<u32>().ok()?;
+    let years: Vec<i32> = if parts.len() == 3 {
+        vec![parts[2].parse().ok()?]
+    } else {
+        let local_year = now.with_timezone(&offset).year();
+        vec![local_year - 1, local_year, local_year + 1]
+    };
+    years.into_iter()
+        .filter_map(|year| NaiveDate::from_ymd_opt(year, month, day))
+        .filter_map(|date| offset.from_local_datetime(&date.and_time(clock)).single())
+        .map(|date| date.with_timezone(&chrono::Utc))
+        // Like the Mac parser, retain a just-expired reset rather than turn it
+        // into next year's deadline. No year is supplied by the CLI.
+        .min_by_key(|date| date.signed_duration_since(now).num_seconds().unsigned_abs())
+        .and_then(|date| u64::try_from(date.timestamp_millis()).ok())
 }
 
 #[cfg(windows)]
@@ -539,6 +620,9 @@ fn codex_identity(result: &Value, dir: &Path) -> Option<String> {
     if account_id.is_empty() {
         return None;
     }
+    if let Some(reported) = account.get("id").or_else(|| account.get("accountId")).and_then(Value::as_str) {
+        if !reported.trim().eq_ignore_ascii_case(&account_id) { return None; }
+    }
     Some(format!("{email}\u{1f}{account_id}"))
 }
 
@@ -679,14 +763,24 @@ pub fn load_snapshots(accounts: &[ManagedAccount]) -> HashMap<String, UsageSnaps
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
+    restored_snapshots(accounts, &saved)
+}
+
+fn restored_snapshots(accounts: &[ManagedAccount], saved: &HashMap<String, StoredSnapshot>) -> HashMap<String, UsageSnapshot> {
     accounts
         .iter()
         .filter(|a| valid(&a.provider, a.slot) && owned(&a.directory))
         .filter_map(|a| {
             let row = saved.get(&id(&a.provider, a.slot))?;
-            (row.identity == a.identity).then(|| (id(&a.provider, a.slot), row.snapshot.clone()))
+            (row.identity == a.identity).then(|| (id(&a.provider, a.slot), restored_snapshot(&row.snapshot)))
         })
         .collect()
+}
+
+fn restored_snapshot(saved: &UsageSnapshot) -> UsageSnapshot {
+    let mut snapshot = saved.clone();
+    if !snapshot.windows.is_empty() { snapshot.status = "stale".into(); }
+    snapshot
 }
 
 fn persist(app: &AppHandle) {
@@ -1046,9 +1140,11 @@ pub fn confirm(app: &AppHandle, provider: String, slot: u8, label: String) -> Re
         *cfg = before;
         return Err(e);
     }
+    generation_counter(&provider).fetch_add(1, Ordering::AcqRel);
     let notch_slots = cfg.notch_slots.clone();
     st.second.lock().unwrap().remove(&key);
     drop(cfg);
+    if provider == "claude" { crate::usage::request_refresh(); } else { crate::codex::request_refresh(); }
     map.remove(&key);
     drop(map);
     request_refresh(&key);
@@ -1149,8 +1245,10 @@ pub fn remove(app: &AppHandle, provider: String, slot: u8) -> Result<(), String>
         *cfg = previous;
         return Err(e);
     }
+    generation_counter(&provider).fetch_add(1, Ordering::AcqRel);
     st.second.lock().unwrap().remove(&id(&provider, slot));
     drop(cfg);
+    if provider == "claude" { crate::usage::request_refresh(); } else { crate::codex::request_refresh(); }
     persist(app);
     let key = id(&provider, slot);
     let absent = UsageSnapshot {
@@ -1303,6 +1401,7 @@ mod tests {
             ),
             Some("a@example.com\u{1f}workspace-a".into())
         );
+        assert_eq!(codex_identity(&json!({"account":{"type":"chatgpt","email":"a@example.com","id":"workspace-b"}}), &dir), None);
         assert_eq!(
             codex_identity(&json!({"account":{"type":"apiKey"}}), &dir),
             None
@@ -1366,6 +1465,29 @@ mod tests {
         assert!(parse_claude_usage("Please run /login first").is_err());
     }
     #[test]
+    fn claude_weekly_only_and_reset_times_do_not_invent_a_session() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-12-31T23:00:00Z").unwrap().to_utc();
+        let text = "Current week (all models): 34% used · resets Jan 7 at 2:59pm (Asia/Seoul)\nCurrent week (Opus): 12% used · resets Jan 7, 2027 at 2:59pm (Asia/Jakarta)";
+        let rows = parse_claude_usage_at(text, now).unwrap();
+        assert_eq!(rows.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["weekly_all", "weekly_opus"]);
+        assert_eq!(rows[0].used, 0.34);
+        assert_eq!(rows[0].resets_at, parse_claude_reset("2027-01-07T14:59:00+09:00", now));
+        assert_eq!(rows[1].resets_at, parse_claude_reset("2027-01-07T14:59:00+07:00", now));
+        assert_eq!(parse_claude_reset("Jan 7 at 2:59pm (America/New_York)", now), None);
+        let january = chrono::DateTime::parse_from_rfc3339("2027-01-02T01:00:00Z").unwrap().to_utc();
+        assert_eq!(parse_claude_reset("Dec 31 at 3pm (Asia/Seoul)", january),
+                   parse_claude_reset("2026-12-31T15:00:00+09:00", january));
+    }
+    #[test]
+    fn restored_managed_reading_is_stale_but_keeps_measurement_and_retry() {
+        let snapshot = UsageSnapshot {status:"ok".into(),fetched_at:123,backoff_until:456,windows:vec![LimitWindow{id:"weekly_all".into(),used:0.4,..Default::default()}],..Default::default()};
+        let restored = restored_snapshot(&snapshot);
+        assert_eq!(restored.status,"stale");
+        assert_eq!(restored.fetched_at,123);
+        assert_eq!(restored.backoff_until,456);
+        assert_eq!(restored.windows[0].used,0.4);
+    }
+    #[test]
     fn cancel_or_restart_cannot_reuse_an_old_login_result() {
         let a = PathBuf::from("C:/private/attempt-a");
         let b = PathBuf::from("C:/private/attempt-b");
@@ -1403,5 +1525,14 @@ mod tests {
         assert!(cmd
             .get_envs()
             .any(|(name, value)| name == "CODEX_HOME" && value.is_some()));
+    }
+    #[test]
+    fn legacy_reply_is_rejected_after_registration_generation_changes() {
+        let account = ManagedAccount {provider:"claude".into(),slot:1,directory:PathBuf::from("private"),identity:"a".into(),label:"A".into(),disconnected:true};
+        assert!(legacy_source_allowed(&[],"claude",1,1));
+        assert!(!legacy_source_allowed(std::slice::from_ref(&account),"claude",1,1));
+        assert!(!legacy_source_allowed(&[],"claude",1,2));
+        assert!(legacy_source_allowed(&[],"claude",2,2));
+        assert!(legacy_source_allowed(std::slice::from_ref(&account),"codex",1,1));
     }
 }

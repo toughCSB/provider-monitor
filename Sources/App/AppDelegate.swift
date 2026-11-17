@@ -24,6 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Keeps the Claude keychain token from ageing out on a Mac where the CLI
     /// is never run by hand. See `ClaudeTokenRefresher`.
     private var tokenRefreshers: [ClaudeTokenRefresher] = []
+    private var claudeRenewalSubscriptions = Set<AnyCancellable>()
+    private var claudeRenewalGeneration: UInt64 = 0
     /// Renews Grok's six-hour session the same way, by launching its CLI. See
     /// `GrokTokenRefresher`.
     private var grokTokenRefresher: GrokTokenRefresher?
@@ -740,6 +742,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Each profile's command receives its own configuration directory.
         // No profile may refresh another account's token.
         for provider in claudeProviders {
+            let generation = claudeRenewalGeneration
             let refresher = ClaudeTokenRefresher(
                 expiry: { await provider.tokenExpiry },
                 reload: { await provider.reloadTokenExpiry() },
@@ -751,13 +754,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             refresher.$outcome
                 .receive(on: RunLoop.main)
                 .sink { [weak self] outcome in
+                    guard let self, self.claudeRenewalGeneration == generation else { return }
                     if case .failed = outcome {
-                        self?.store?.reportRenewalFailed(providerID: provider.id)
+                        self.store?.reportRenewalFailed(providerID: provider.id)
                     } else if case .refreshed = outcome {
-                        self?.store?.refresh(providerID: provider.id)
+                        self.store?.refresh(providerID: provider.id)
                     }
                 }
-                .store(in: &cancellables)
+                .store(in: &claudeRenewalSubscriptions)
 
             refresher.start()
             tokenRefreshers.append(refresher)
@@ -810,10 +814,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let refresher = ClaudeTokenRefresher(expiry: { await claude.tokenExpiry },
                                                     reload: { await claude.reloadTokenExpiry() },
                                                     profile: claude.profile)
+                let generation = self.claudeRenewalGeneration
                 refresher.$outcome.receive(on: RunLoop.main).sink { [weak self] outcome in
-                    if case .failed = outcome { self?.store?.reportRenewalFailed(providerID: provider.id) }
-                    else if case .refreshed = outcome { self?.store?.refresh(providerID: provider.id) }
-                }.store(in: &self.cancellables)
+                    guard let self, self.claudeRenewalGeneration == generation else { return }
+                    if case .failed = outcome { self.store?.reportRenewalFailed(providerID: provider.id) }
+                    else if case .refreshed = outcome { self.store?.refresh(providerID: provider.id) }
+                }.store(in: &self.claudeRenewalSubscriptions)
                 self.tokenRefreshers.append(refresher)
                 refresher.start()
             }
@@ -827,8 +833,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let replacements = registered.isEmpty ? self.legacyAccountProviders(for: family) : registered
             let previouslyHidden = replacements.map(\.id).filter { !preferences.isConnected($0) }
             if family == .claude {
+                self.claudeRenewalGeneration &+= 1
                 self.tokenRefreshers.forEach { $0.stop() }
                 self.tokenRefreshers.removeAll()
+                self.claudeRenewalSubscriptions.removeAll()
                 self.claudeProviders.removeAll()
             }
             store.replaceFamily(family, with: replacements)

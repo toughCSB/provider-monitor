@@ -33,7 +33,7 @@ final class ManagedAccountsTests: XCTestCase {
             login: { _, home, _ in
                 XCTAssertEqual(home.deletingLastPathComponent().path, root.path)
                 return identity
-            }, readIdentity: { _, _ in identity })
+            }, readIdentity: { _, _, _ in identity })
         var changes: [MonitoredAccounts.Family] = []
         controller.onChanged = { changes.append($0) }
         controller.begin(.codex)
@@ -57,7 +57,7 @@ final class ManagedAccountsTests: XCTestCase {
         let (root, defaults) = try fixture()
         let identity = alice
         let controller = ManagedAccountController(defaults: defaults, root: root,
-            login: { _, _, _ in identity }, readIdentity: { _, _ in identity })
+            login: { _, _, _ in identity }, readIdentity: { _, _, _ in identity })
         controller.begin(.codex)
         await finishLogin(controller)
         await controller.confirm()
@@ -78,7 +78,7 @@ final class ManagedAccountsTests: XCTestCase {
         let (root, defaults) = try fixture()
         let first = alice, second = bob
         let controller = ManagedAccountController(defaults: defaults, root: root,
-            login: { _, _, _ in first }, readIdentity: { _, _ in second })
+            login: { _, _, _ in first }, readIdentity: { _, _, _ in second })
         controller.begin(.claude)
         await finishLogin(controller)
         await controller.confirm()
@@ -94,7 +94,7 @@ final class ManagedAccountsTests: XCTestCase {
             login: { _, _, _ in
                 try? await Task.sleep(nanoseconds: 50_000_000)
                 return identity
-            }, readIdentity: { _, _ in identity })
+            }, readIdentity: { _, _, _ in identity })
         controller.begin(.codex)
         controller.cancel()
         try await Task.sleep(nanoseconds: 100_000_000)

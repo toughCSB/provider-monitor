@@ -342,6 +342,37 @@ final class ClaudeTokenRefresherTests: XCTestCase {
         XCTAssertFalse(first === refresher.timerForTesting)
     }
 
+    func testStopWhileExpiryIsPendingPreventsAnOldSourceFromLaunching() async {
+        let spy = Spy()
+        let gate = Gate()
+        let refresher = refresher(
+            spy: spy, before: inSeconds(60), after: inSeconds(8 * 3600),
+            wrapExpiry: { original in { await gate.wait(); return await original() } }
+        )
+        let task = Task { await refresher.considerRenewing(now: now) }
+        while !refresher.isRunningForTesting { await Task.yield() }
+        refresher.stop()
+        await gate.open()
+        await task.value
+        XCTAssertEqual(spy.launches, 0)
+        XCTAssertEqual(refresher.outcome, .idle)
+    }
+
+    func testStopWhileRenewalIsInFlightCannotPublishOldOutcome() async {
+        let gate = Gate()
+        let refresher = ClaudeTokenRefresher(
+            expiry: { self.inSeconds(60) }, reload: { self.inSeconds(8 * 3600) },
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
+            launcher: { _, _ in (4242, { await gate.wait(); return 1 }) }
+        )
+        let task = Task { await refresher.considerRenewing(now: now) }
+        while refresher.launchedPID == nil { await Task.yield() }
+        refresher.stop()
+        await gate.open()
+        await task.value
+        XCTAssertEqual(refresher.outcome, .idle)
+    }
+
     // MARK: - No concurrent launches
 
     /// `isRunning` has to be claimed *before* `considerRenewing`'s only
@@ -527,6 +558,19 @@ final class ClaudeTokenRefresherTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(start), 3)
         XCTAssertEqual(kill(pid, 0), -1, "the pid must not still exist once wait() has returned")
         XCTAssertEqual(errno, ESRCH, "specifically gone, not merely unreachable for some other reason")
+    }
+
+    func testCancellingRenewalWaitKillsOnlyItsProcess() async throws {
+        let stubborn = try makeStubbornScript()
+        defer { try? FileManager.default.removeItem(at: stubborn) }
+        let (pid, exit) = try ClaudeTokenRefresher.run(stubborn, timeout: 30)
+        let task = Task { await exit() }
+        try await Task.sleep(for: .milliseconds(100))
+        task.cancel()
+        let status = await task.value
+        XCTAssertNil(status)
+        XCTAssertEqual(kill(pid, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
     }
 
     /// A script that ignores SIGTERM so a test can force the SIGKILL branch,

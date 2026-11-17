@@ -571,6 +571,7 @@ function windowLike(ws,kind){ return ws.find(w=>laneIs(w,kind))||null; }
 // matches, falling back to the default when it has none.
 function headlineOf(snap,id){
   const ws=snap.windows; if(!ws.length) return null;
+  if(id==='gemini' && ws.length===1 && ws[0].id==='requests' && ws[0].count!=null) return ws[0];
   const base=id.startsWith('claude-')?'claude':id.startsWith('codex-')?'codex':id;
   const byId=x=>ws.find(w=>w.id===x)||null;
   const lim=limitFor(id);
@@ -585,10 +586,10 @@ function headlineOf(snap,id){
   if(id==='cursor') return byId('included')||byId('api'); // no weekly window: Cursor resets on its billing cycle instead
   if(id==='grok') return byId('credits'); // Grok Build is already the weekly pool
   if(id==='opencode') return byId('weekly')||byId('rolling');
-  const fam=ws.filter(w=>laneFamily(w)===agPrefs.model), lanes=fam.length?fam:ws;
+  const lanes=ws.filter(w=>laneFamily(w)===agPrefs.model);
   const gLim=limitFor('gemini');
   if(gLim!=='automatic'){ const w=tightestOf(lanes.filter(w=>laneIs(w,gLim))); if(w) return w; }
-  return tightestOf(lanes.filter(w=>w.used<1))||tightestOf(lanes)||lanes[0];
+  return tightestOf(lanes.filter(w=>w.used<1))||tightestOf(lanes)||lanes[0]||null;
 }
 function staleOf(snap){ if(snap.status==='stale') return true; return snap.fetched_at>0 && (Date.now()-snap.fetched_at)>5*60*1000; }
 let stateSnap={sessions:[],agg:'idle'};
@@ -728,8 +729,7 @@ function renderCard(){
     // 5-hour lane per model family, so resolve that lane in the same selected family as the ring.
     const heroLead=headlineOf(snap,p.id);
     const family=p.id==='gemini'?snap.windows.filter(w=>laneFamily(w)===agPrefs.model):snap.windows;
-    const candidates=family.length?family:snap.windows;
-    const hero5h=tightestOf(candidates.filter(w=>laneIs(w,'5h')));
+    const hero5h=tightestOf(family.filter(w=>laneIs(w,'5h')));
     const heroItem=w=>`<div class="reset-item"><div class="reset-label">${esc(textCopy(w.label))}</div><div class="reset-time">${heroDuration(w.resets_at)}</div></div>`;
     if(heroLead||(hero5h&&hero5h!==heroLead)){
       html+=`<div class="reset-hero">`;

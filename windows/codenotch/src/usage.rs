@@ -373,15 +373,17 @@ fn backoff_secs(consecutive: u32, retry_after: Option<u64>) -> u64 {
     crate::polling::backoff_secs(exp.clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS), retry_after)
 }
 
-fn set_and_broadcast(app: &AppHandle, mutate: impl FnOnce(&mut UsageSnapshot)) {
-    let st = app.state::<AppState>();
-    let snap = {
-        let mut u = st.usage.lock().unwrap();
-        mutate(&mut u);
-        u.clone()
-    };
-    persist(&snap);
-    let _ = app.emit("usage", &snap);
+fn set_and_broadcast(app: &AppHandle, generation: u64, mutate: impl FnOnce(&mut UsageSnapshot)) {
+    crate::managed::with_legacy_source(app, "claude", generation, || {
+        let st = app.state::<AppState>();
+        let snap = {
+            let mut u = st.usage.lock().unwrap();
+            mutate(&mut u);
+            u.clone()
+        };
+        persist(&snap);
+        let _ = app.emit("usage", &snap);
+    });
 }
 
 pub fn start(app: AppHandle) {
@@ -390,16 +392,21 @@ pub fn start(app: AppHandle) {
         {
             let st = app.state::<AppState>();
             let snap = st.usage.lock().unwrap().clone();
-            let _ = app.emit("usage", &snap);
+            if !crate::managed::has_provider(&app, "claude") { let _ = app.emit("usage", &snap); }
         }
         let mut consecutive_429: u32 = 0;
         let mut renewer = Renewer::default();
         loop {
+            let generation = crate::managed::generation("claude");
+            if crate::managed::has_provider(&app, "claude") {
+                sleep_interruptible(30);
+                continue;
+            }
             // Ahead of the back-off: renewing never touches the usage endpoint, and a fresh token deserves a fresh try
             if let Some(cred) = read_credentials() {
                 if renewer.maybe_renew(&cred) == Some(true) {
                     consecutive_429 = 0;
-                    set_and_broadcast(&app, |u| u.backoff_until = 0);
+                    set_and_broadcast(&app, generation, |u| u.backoff_until = 0);
                 }
             }
             // No requests inside the backoff window
@@ -414,12 +421,12 @@ pub fn start(app: AppHandle) {
                 continue;
             }
             match read_credentials() {
-                None => set_and_broadcast(&app, |u| {
+                None => set_and_broadcast(&app, generation, |u| {
                     u.status = "needsAuth".into();
                     u.note = "No Claude Code credential found".into();
                 }),
                 // Expired is not signed out: keep the last reading, dimmed and dated, and send nothing
-                Some(cred) if cred.expired(now_ms()) => set_and_broadcast(&app, |u| {
+                Some(cred) if cred.expired(now_ms()) => set_and_broadcast(&app, generation, |u| {
                     u.status = if u.windows.is_empty() { "needsAuth" } else { "stale" }.into();
                     u.note = EXPIRED_NOTE.into();
                 }),
@@ -437,7 +444,7 @@ pub fn start(app: AppHandle) {
                     match result {
                         Ok(windows) => {
                             consecutive_429 = 0;
-                            set_and_broadcast(&app, |u| {
+                            set_and_broadcast(&app, generation, |u| {
                                 u.status = "ok".into();
                                 u.windows = windows;
                                 u.fetched_at = now_ms();
@@ -445,14 +452,14 @@ pub fn start(app: AppHandle) {
                                 u.backoff_until = 0;
                             });
                         }
-                        Err(FetchErr::NeedsAuth) => set_and_broadcast(&app, |u| {
+                        Err(FetchErr::NeedsAuth) => set_and_broadcast(&app, generation, |u| {
                             u.status = "needsAuth".into();
                             u.note = auth_note.into();
                         }),
                         Err(FetchErr::RateLimited(ra)) => {
                             consecutive_429 += 1;
                             let wait = backoff_secs(consecutive_429 - 1, ra);
-                            set_and_broadcast(&app, |u| {
+                            set_and_broadcast(&app, generation, |u| {
                                 if !u.windows.is_empty() {
                                     u.status = "stale".into();
                                 }
@@ -460,7 +467,7 @@ pub fn start(app: AppHandle) {
                                 u.backoff_until = crate::polling::deadline_ms(now_ms(), wait);
                             });
                         }
-                        Err(FetchErr::Other(msg)) => set_and_broadcast(&app, |u| {
+                        Err(FetchErr::Other(msg)) => set_and_broadcast(&app, generation, |u| {
                             if u.windows.is_empty() {
                                 u.status = "error".into();
                             } else {

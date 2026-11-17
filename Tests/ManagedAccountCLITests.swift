@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import XCTest
 @testable import ProviderMonitor
 
@@ -41,11 +42,13 @@ final class ManagedAccountCLITests: XCTestCase {
 
     private let rpcScript = """
     #!/bin/sh
+    echo launch >> "$CODEX_HOME/launches"
     printf '%s' "$HOME" > "$CODEX_HOME/observed-system-home"
     printf '%s' "$CODEX_HOME" > "$CODEX_HOME/observed-config-home"
     while IFS= read -r line; do
       case "$line" in
         *'"method":"initialize"'*) echo '{"id":0,"result":{}}' ;;
+        *'"id":3'*) echo '{"id":3,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"plus"}}}' ;;
         *'"method":"account/read"'*) echo '{"id":1,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"plus"}}}' ;;
         *'"method":"account/rateLimits/read"'*) echo '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1800000000},"secondary":{"usedPercent":40,"windowDurationSeconds":604800}}}}' ;;
       esac
@@ -68,6 +71,8 @@ final class ManagedAccountCLITests: XCTestCase {
             XCTAssertEqual(usage.windows[1].duration, 604_800)
             XCTAssertEqual(usage.windows[0].usedFraction, 0.25)
             XCTAssertEqual(usage.plan, "plus")
+            XCTAssertEqual(try String(contentsOf: home.appendingPathComponent("launches"), encoding: .utf8)
+                .split(separator: "\n").count, 2, "identity starts once; the complete usage attempt starts once")
             XCTAssertEqual(try String(contentsOf: home.appendingPathComponent("observed-system-home"), encoding: .utf8),
                            ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory())
             XCTAssertEqual(try String(contentsOf: home.appendingPathComponent("observed-config-home"), encoding: .utf8), home.path)
@@ -89,6 +94,33 @@ final class ManagedAccountCLITests: XCTestCase {
             } catch let error as ManagedCLIError {
                 XCTAssertEqual(error, .identityChanged)
             }
+        }
+    }
+
+    func testChangedAppServerAccountIsRejectedBeforeRateLimitRequest() async throws {
+        let home = try directory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try auth(home: home)
+        let binary = try executable("""
+        #!/bin/sh
+        while IFS= read -r line; do
+          case "$line" in
+            *'"method":"initialize"'*) echo '{"id":0,"result":{}}' ;;
+            *'"method":"account/read"'*) echo '{"id":1,"result":{"account":{"type":"chatgpt","email":"other@example.com"}}}' ;;
+            *'"method":"account/rateLimits/read"'*) touch "$CODEX_HOME/rate-requested" ;;
+          esac
+        done
+        """, in: home)
+        let expected = ManagedCLIIdentity(subject: "person-1", email: "user@example.com",
+                                          workspaceID: "workspace-1", plan: nil)
+        try await ManagedAccountCLI.$codexBinaryOverride.withValue(binary) {
+            do {
+                _ = try await ManagedAccountCLI.usage(family: .codex, home: home, expected: expected)
+                XCTFail("Expected identity mismatch")
+            } catch let error as ManagedCLIError {
+                XCTAssertEqual(error, .identityChanged)
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent("rate-requested").path))
         }
     }
 
@@ -184,6 +216,91 @@ final class ManagedAccountCLITests: XCTestCase {
         }
     }
 
+    func testCancelDuringPostLoginIdentityStopsItsOwnChild() async throws {
+        let home = try directory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try executable("""
+        #!/bin/sh
+        if [ "$1" = auth ] && [ "$2" = login ]; then exit 0; fi
+        echo $$ > "$CLAUDE_CONFIG_DIR/identity-pid"
+        while :; do :; done
+        """, in: home)
+        let cancellation = ManagedCLICancellation()
+        try await ManagedAccountCLI.$claudeBinaryOverride.withValue(binary) {
+            let task = Task { try await ManagedAccountCLI.login(family: .claude, home: home, cancellation: cancellation) }
+            let pidFile = home.appendingPathComponent("identity-pid")
+            for _ in 0..<200 where !FileManager.default.fileExists(atPath: pidFile.path) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let pid = Int32(try XCTUnwrap(String(contentsOf: pidFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)))!
+            cancellation.cancel()
+            do { _ = try await task.value; XCTFail("Expected cancellation") }
+            catch let error as ManagedCLIError { XCTAssertEqual(error, .cancelled) }
+            XCTAssertNotEqual(Darwin.kill(pid, 0), 0)
+        }
+    }
+
+    func testTaskCancelDuringUsageTerminatesItsOwnAppServer() async throws {
+        let home = try directory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        try auth(home: home)
+        let binary = try executable("""
+        #!/bin/sh
+        while IFS= read -r line; do
+          case "$line" in
+            *'"method":"initialize"'*) echo '{"id":0,"result":{}}' ;;
+            *'"method":"account/read"'*) echo '{"id":1,"result":{"account":{"type":"chatgpt","email":"user@example.com"}}}' ;;
+            *'"method":"account/rateLimits/read"'*) echo $$ > "$CODEX_HOME/usage-pid"; while :; do :; done ;;
+          esac
+        done
+        """, in: home)
+        let expected = ManagedCLIIdentity(subject: "person-1", email: "user@example.com",
+                                          workspaceID: "workspace-1", plan: nil)
+        try await ManagedAccountCLI.$codexBinaryOverride.withValue(binary) {
+            let task = Task { try await ManagedAccountCLI.usage(family: .codex, home: home, expected: expected) }
+            let pidFile = home.appendingPathComponent("usage-pid")
+            for _ in 0..<200 where !FileManager.default.fileExists(atPath: pidFile.path) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let pid = Int32(try XCTUnwrap(String(contentsOf: pidFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)))!
+            task.cancel()
+            do { _ = try await task.value; XCTFail("Expected cancellation") }
+            catch let error as ManagedCLIError { XCTAssertEqual(error, .cancelled) }
+            XCTAssertNotEqual(Darwin.kill(pid, 0), 0)
+        }
+    }
+
+    func testTaskCancelDuringClaudeUsageTerminatesItsOwnChild() async throws {
+        let home = try directory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try executable("""
+        #!/bin/sh
+        if [ "$1" = auth ] && [ "$2" = status ]; then
+          echo '{"loggedIn":true,"authMethod":"claude.ai","email":"user@example.com","orgId":"team"}'
+          exit 0
+        fi
+        echo $$ > "$CLAUDE_CONFIG_DIR/usage-pid"
+        while :; do :; done
+        """, in: home)
+        let expected = ManagedCLIIdentity(subject: "user@example.com", email: "user@example.com",
+                                          workspaceID: "team", plan: nil)
+        try await ManagedAccountCLI.$claudeBinaryOverride.withValue(binary) {
+            let task = Task { try await ManagedAccountCLI.usage(family: .claude, home: home, expected: expected) }
+            let pidFile = home.appendingPathComponent("usage-pid")
+            for _ in 0..<200 where !FileManager.default.fileExists(atPath: pidFile.path) {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let pid = Int32(try XCTUnwrap(String(contentsOf: pidFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)))!
+            task.cancel()
+            do { _ = try await task.value; XCTFail("Expected cancellation") }
+            catch let error as ManagedCLIError { XCTAssertEqual(error, .cancelled) }
+            XCTAssertNotEqual(Darwin.kill(pid, 0), 0)
+        }
+    }
+
     func testTimeoutDoesNotRevealChildOutput() async throws {
         let home = try directory()
         defer { try? FileManager.default.removeItem(at: home) }
@@ -198,6 +315,32 @@ final class ManagedAccountCLITests: XCTestCase {
                     XCTAssertEqual(error, .timedOut)
                     XCTAssertFalse(error.localizedDescription.contains("secret-from-child"))
                 }
+            }
+        }
+    }
+
+    func testClaudeUsageSharesOneDeadlineAcrossIdentityAndUsage() async throws {
+        let home = try directory()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try executable("""
+        #!/bin/sh
+        if [ "$1" = auth ]; then
+          sleep 0.75
+          echo '{"loggedIn":true,"authMethod":"claude.ai","email":"user@example.com","orgId":"team"}'
+          exit 0
+        fi
+        touch "$CLAUDE_CONFIG_DIR/usage-started"
+        sleep 0.75
+        echo 'Current session: 12% used'
+        """, in: home)
+        let expected = ManagedCLIIdentity(subject: "user@example.com", email: "user@example.com", workspaceID: "team", plan: nil)
+        try await ManagedAccountCLI.$claudeBinaryOverride.withValue(binary) {
+            try await ManagedAccountCLI.$timeoutOverride.withValue(1.5) {
+                do {
+                    _ = try await ManagedAccountCLI.usage(family: .claude, home: home, expected: expected)
+                    XCTFail("Separate stage deadlines incorrectly extended the attempt")
+                } catch let error as ManagedCLIError { XCTAssertEqual(error, .timedOut) }
+                XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent("usage-started").path))
             }
         }
     }

@@ -118,11 +118,13 @@ pub fn request_refresh(kind: Kind) {
 #[derive(Clone, serde::Serialize)]
 struct AccountEvent<'a> { id: &'a str, provider: &'a str, snapshot: &'a UsageSnapshot }
 
-fn publish(app: &AppHandle, kind: Kind, id: &str, snapshot: UsageSnapshot) {
-    let st = app.state::<AppState>();
-    st.second.lock().unwrap().insert(id.to_owned(), snapshot.clone());
-    let _ = app.emit("account2", AccountEvent { id, provider: kind.id(), snapshot: &snapshot });
-    crate::repaint_tray(app);
+fn publish(app: &AppHandle, kind: Kind, id: &str, generation: u64, snapshot: UsageSnapshot) {
+    let published = crate::managed::with_legacy_source(app, kind.id(), generation, || {
+        let st = app.state::<AppState>();
+        st.second.lock().unwrap().insert(id.to_owned(), snapshot.clone());
+        let _ = app.emit("account2", AccountEvent { id, provider: kind.id(), snapshot: &snapshot });
+    });
+    if published.is_some() { crate::repaint_tray(app); }
 }
 
 fn clear(app: &AppHandle, kind: Kind, id: &str) {
@@ -208,6 +210,7 @@ fn start_one(app: AppHandle, kind: Kind) {
         let mut previous_identity: Option<String> = None;
         let mut snapshot = UsageSnapshot::default();
         loop {
+            let generation = crate::managed::generation(kind.id());
             let current = active(&app, kind);
             if current != previous_profile {
                 if let Some(old) = previous_profile.take() { clear(&app, kind, &old.id); }
@@ -250,7 +253,7 @@ fn start_one(app: AppHandle, kind: Kind) {
                 } else {
                     snapshot = UsageSnapshot { status: "needsAuth".into(), note: "Account 2 signed out or identity unavailable".into(), ..Default::default() };
                 }
-                publish(&app, kind, &profile.id, snapshot.clone());
+                publish(&app, kind, &profile.id, generation, snapshot.clone());
             }
             let seconds = if previous_profile.is_some() {
                 crate::polling::poll_wait_secs(300, snapshot.backoff_until, now_ms())

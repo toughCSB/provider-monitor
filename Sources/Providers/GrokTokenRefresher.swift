@@ -58,6 +58,8 @@ final class GrokTokenRefresher: ObservableObject {
     private let expiry: @MainActor () async -> Date?
 
     private var timer: Timer?
+    private var activeTask: Task<Void, Never>?
+    private var lifecycleGeneration: UInt64 = 0
     private var isRunning = false
     /// Exposed for the test that proves `isRunning` is claimed *before* the
     /// first `await` — set any later, a second overlapping call would still see
@@ -111,10 +113,18 @@ final class GrokTokenRefresher: ObservableObject {
     func stop() {
         timer?.invalidate()
         timer = nil
+        lifecycleGeneration &+= 1
+        activeTask?.cancel()
+        activeTask = nil
     }
 
     private func tick() {
-        Task { await considerRenewing() }
+        guard activeTask == nil else { return }
+        let generation = lifecycleGeneration
+        activeTask = Task { [weak self] in
+            await self?.considerRenewing()
+            if self?.lifecycleGeneration == generation { self?.activeTask = nil }
+        }
     }
 
     // MARK: - The gate
@@ -125,8 +135,10 @@ final class GrokTokenRefresher: ObservableObject {
         guard !isRunning else { return }
         isRunning = true
         defer { isRunning = false; launchedPID = nil }
+        let generation = lifecycleGeneration
 
         let current = await expiry()
+        guard lifecycleGeneration == generation, !Task.isCancelled else { return }
         guard renewalPolicy.shouldAttempt(expiry: current, now: now, margin: margin,
                                           cooldown: cooldown),
               let current
@@ -151,9 +163,11 @@ final class GrokTokenRefresher: ObservableObject {
             Log.usage.error("grok token renewal could not start: \(String(describing: error), privacy: .public)")
             return
         }
+        guard lifecycleGeneration == generation, !Task.isCancelled else { return }
 
         // Judged on the outcome, never on the exit status.
         let after = await expiry()
+        guard lifecycleGeneration == generation, !Task.isCancelled else { return }
         guard let after, after > current else {
             fail("Grok session renewal has not completed. Automatic renewal will retry.")
             Log.usage.error("grok token renewal ran (exit \(status ?? -1)) but the expiry did not move; still \(String(describing: after), privacy: .public)")
@@ -204,7 +218,7 @@ final class GrokTokenRefresher: ObservableObject {
 
         let wait: () async -> Int32? = {
             let deadline = Date().addingTimeInterval(timeout)
-            while process.isRunning, Date() < deadline {
+            while process.isRunning, Date() < deadline, !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
             guard !process.isRunning else {

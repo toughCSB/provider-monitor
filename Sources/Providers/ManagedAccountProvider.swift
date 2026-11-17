@@ -45,10 +45,15 @@ actor ManagedAccountProvider: UsageProvider {
         archive.saveBackoffUntil(nil, providerID: id)
         return ProviderSnapshot(id: id, displayName: displayName, glyph: glyph, fidelity: .official,
                                 status: .ok, windows: reading.windows,
-                                headlineID: record.family == .codex ? "primary" : "session",
+                                headlineID: Self.headline(in: reading.windows, family: record.family),
                                 weeklyID: record.family == .codex ? "secondary" : "weekly_all",
                                 accountNumber: record.slot,
                                 plan: reading.plan ?? record.identity.plan,
                                 observation: UsageObservation(measuredAt: Date(), source: .cli, accountID: usageAccountID))
+    }
+
+    static func headline(in windows: [LimitWindow], family: MonitoredAccounts.Family) -> String? {
+        let preferred = family == .codex ? ["primary", "secondary"] : ["session", "weekly_all"]
+        return preferred.first { id in windows.contains { $0.id == id } } ?? windows.first?.id
     }
 }
