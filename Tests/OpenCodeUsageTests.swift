@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import ProviderMonitor
 
 /// The Go plan windows, pinned to the live response (secret redacted) — the
@@ -96,5 +97,81 @@ final class OpenCodeCredentialsTests: XCTestCase {
         let url = try file(#"{"opencode-go":{"type":"api","key":""}}"#)
         defer { try? FileManager.default.removeItem(at: url) }
         XCTAssertNil(OpenCodeCredentials.load(from: url))
+    }
+
+    func testConsoleKeyInAuthFileBeatsLeftoverGoKey() throws {
+        let url = try file(#"{"opencode":{"type":"api","key":"oc_sk_current"},"opencode-go":{"type":"api","key":"sk-old"}}"#)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let selected = try XCTUnwrap(OpenCodeCredentials.load(from: url))
+        XCTAssertEqual(selected.token, "oc_sk_current")
+        XCTAssertFalse(selected.oauth)
+        XCTAssertEqual(OpenCodeProvider.endpoint(for: selected), OpenCodeUsage.endpoint)
+    }
+
+    func testSQLiteConsoleKeyBeatsStaleFileAndOtherProviders() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opencode-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try #"{"opencode-go":{"type":"api","key":"sk-stale"}}"#
+            .write(to: directory.appendingPathComponent("auth.json"), atomically: true, encoding: .utf8)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(directory.appendingPathComponent("opencode.db").path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, """
+            CREATE TABLE credential (integration_id TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+            INSERT INTO credential VALUES ('openai', '{"type":"api","key":"sk-other"}', 1, 20);
+            INSERT INTO credential VALUES ('opencode-go', '{"type":"api","key":"sk-old"}', 1, 30);
+            INSERT INTO credential VALUES ('opencode', '{"type":"api","key":"oc_sk_current"}', 1, 10);
+            INSERT INTO credential VALUES ('opencode', '{"type":"api","key":"oc_sk_inactive"}', 0, 40);
+            """, nil, nil, nil), SQLITE_OK)
+
+        let selected = try XCTUnwrap(OpenCodeCredentials.load(in: directory))
+        XCTAssertEqual(selected.token, "oc_sk_current")
+        XCTAssertEqual(OpenCodeProvider.endpoint(for: selected), OpenCodeUsage.endpoint)
+    }
+
+    func testSQLiteOAuthUsesInferenceRoute() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opencode-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(directory.appendingPathComponent("opencode.db").path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, """
+            CREATE TABLE credential (integration_id TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+            INSERT INTO credential VALUES ('openai', '{"type":"api","key":"sk-other"}', 1, 30);
+            INSERT INTO credential VALUES ('opencode', '{"type":"oauth","access":"oauth-token","expires":"4070908800000","metadata":{"orgID":"org-test"}}', 1, 20);
+            """, nil, nil, nil), SQLITE_OK)
+
+        let selected = try XCTUnwrap(OpenCodeCredentials.load(in: directory))
+        XCTAssertTrue(selected.oauth)
+        XCTAssertEqual(selected.org, "org-test")
+        XCTAssertEqual(OpenCodeProvider.endpoint(for: selected).path, "/inference/go/v1/usage")
+    }
+
+    func testNoOpenCodeIdentityInDatabaseIsMissing() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("opencode-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(directory.appendingPathComponent("opencode.db").path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, """
+            CREATE TABLE credential (integration_id TEXT, value TEXT, active INTEGER, time_updated INTEGER);
+            INSERT INTO credential VALUES ('openai', '{"type":"api","key":"sk-other"}', 1, 1);
+            """, nil, nil, nil), SQLITE_OK)
+        XCTAssertNil(OpenCodeCredentials.load(in: directory))
+    }
+}
+
+final class OpenCodeProviderCredentialStatusTests: XCTestCase {
+    func testExpiredAPIKeyCodeIsDistinguishedFromOtherUnauthorizedAnswers() {
+        XCTAssertTrue(OpenCodeProvider.isExpiredAPIKey(
+            Data(#"{"error":{"code":"api_key_expired"}}"#.utf8)))
+        XCTAssertFalse(OpenCodeProvider.isExpiredAPIKey(
+            Data(#"{"error":{"code":"unauthorized"}}"#.utf8)))
     }
 }

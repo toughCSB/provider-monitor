@@ -282,10 +282,10 @@ struct ClaudeUsageCLI: Sendable {
             ))
         }
 
-        // Without the session window there is no headline, and the caller asks
-        // for one by id. Better to fall back to the token path than to draw a
-        // ring with a hole in it.
-        guard windows.contains(where: { $0.id == "session" }) else {
+        // Some plans report only weekly limits. That is still a valid reading;
+        // the snapshot keeps its session headline empty rather than claiming
+        // that a weekly percentage is a five-hour limit.
+        guard !windows.isEmpty else {
             throw UsageProviderError.badResponse(status: 0)
         }
         return windows.sorted(by: UsageResponse.displayOrder)

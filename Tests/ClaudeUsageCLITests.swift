@@ -68,12 +68,13 @@ final class ClaudeUsageCLITests: XCTestCase {
         XCTAssertEqual(windows.count, 2)
     }
 
-    /// Without the session window there is no headline, and the snapshot asks
-    /// for one by id. Falling back to the token path beats drawing a hole.
-    func testAnAnswerWithoutASessionIsRefused() {
+    /// A plan can report only weekly limits; the CLI has answered successfully.
+    func testAnAnswerWithoutASessionKeepsTheWeeklyReading() throws {
         let text = "Current week (all models): 4% used · resets Sep 14 at 5:59am (Asia/Jakarta)"
 
-        XCTAssertThrowsError(try ClaudeUsageCLI.parse(text, now: Date()))
+        let windows = try ClaudeUsageCLI.parse(text, now: Date())
+        XCTAssertEqual(windows.map(\.id), ["weekly_all"])
+        XCTAssertEqual(windows[0].usedFraction, 0.04)
     }
 
     func testUnrecognisedOutputIsRefusedRatherThanGuessedAt() {

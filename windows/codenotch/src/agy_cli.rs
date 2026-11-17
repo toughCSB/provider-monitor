@@ -243,6 +243,21 @@ fn quote_arg(arg: &str) -> String {
     res
 }
 
+const NO_AUTO_UPDATE: (&str, &str) = ("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+
+fn environment_block(vars: impl IntoIterator<Item = (String, String)>) -> Vec<u16> {
+    let mut vars: Vec<_> = vars.into_iter()
+        .filter(|(key, _)| !key.is_empty() && !key.eq_ignore_ascii_case(NO_AUTO_UPDATE.0))
+        .chain(std::iter::once((NO_AUTO_UPDATE.0.into(), NO_AUTO_UPDATE.1.into())))
+        .collect();
+    vars.sort_by_key(|(key, _)| key.to_ascii_uppercase());
+    let mut block: Vec<u16> = vars.iter()
+        .flat_map(|(key, value)| format!("{key}={value}").encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>())
+        .collect();
+    block.push(0);
+    block
+}
+
 /// Spawns a hidden process connected to a native Windows ConPTY (Pseudo Console) inside a JobObject.
 /// Drains up to 64 KB of stdout concurrently, enforces timeout, and cleans up all descendants.
 #[cfg(windows)]
@@ -268,7 +283,7 @@ fn run_cmd_conpty(
     use windows::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
         InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
-        WaitForSingleObject, CREATE_SUSPENDED,
+        WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
         EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
         PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTUPINFOEXW,
         STARTF_USESTDHANDLES,
@@ -409,6 +424,8 @@ fn run_cmd_conpty(
     let mut cmd_line_u16: Vec<u16> = cmd_line_str.encode_utf16().chain(std::iter::once(0)).collect();
 
     let cwd_u16: Option<Vec<u16>> = cwd.map(|p| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect());
+    let env_block = environment_block(std::env::vars_os().map(|(key, value)|
+        (key.to_string_lossy().into_owned(), value.to_string_lossy().into_owned())));
 
     let mut si_ex = STARTUPINFOEXW::default();
     si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -425,8 +442,8 @@ fn run_cmd_conpty(
             None,
             None,
             false,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
-            None,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            Some(env_block.as_ptr() as *const _),
             cwd_u16.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
             &si_ex.StartupInfo,
             &mut proc_info,
@@ -520,6 +537,21 @@ pub fn read_quota() -> Result<Vec<LimitWindow>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_probe_disables_cli_updates_without_dropping_other_environment() {
+        let block = environment_block([
+            ("Path".into(), "C:\\bin".into()),
+            ("agy_cli_disable_auto_update".into(), "0".into()),
+            ("APPDATA".into(), "C:\\data".into()),
+        ]);
+        let rendered = String::from_utf16(&block).unwrap();
+        assert!(rendered.contains("AGY_CLI_DISABLE_AUTO_UPDATE=true\0"));
+        assert!(!rendered.contains("agy_cli_disable_auto_update=0"));
+        assert!(rendered.contains("Path=C:\\bin\0"));
+        assert!(rendered.contains("APPDATA=C:\\data\0"));
+        assert!(rendered.ends_with("\0\0"));
+    }
 
     #[test]
     fn quoted_paths_keep_backslashes() {

@@ -33,7 +33,7 @@ actor OpenCodeProvider: UsageProvider {
     }
 
     nonisolated var signInRoute: SignInRoute {
-        .guidance(L10n.t("Usage rides on the opencode-go key OpenCode stores on sign-in — connect Go inside OpenCode (`opencode auth login`) and the notch reads it."))
+        .guidance(L10n.t("Sign in to OpenCode with `opencode auth login`; Provider Monitor reads OpenCode's own credential."))
     }
 
     nonisolated func forgetCachedCredential() {
@@ -42,7 +42,7 @@ actor OpenCodeProvider: UsageProvider {
     }
 
     nonisolated func account() -> ProviderAccount? {
-        guard OpenCodeCredentials.load() != nil else { return nil }
+        guard OpenCodeCredentials.load(in: OpenCodeCredentials.dataDirectory) != nil else { return nil }
         return ProviderAccount(
             label: nil,   // the key carries no address
             plan: "Go",
@@ -60,12 +60,12 @@ actor OpenCodeProvider: UsageProvider {
 
         // Re-read on every fetch. This is an ordinary file, not a keychain
         // item: reading it puts no prompt in front of anyone.
-        guard let credentials = OpenCodeCredentials.load() else {
+        guard let credentials = OpenCodeCredentials.load(in: OpenCodeCredentials.dataDirectory) else {
             throw UsageProviderError.needsAuth
         }
 
         do {
-            let data = try await fetch(token: credentials.token)
+            let data = try await fetch(credentials)
             guard let text = String(data: data, encoding: .utf8) else {
                 throw UsageProviderError.badResponse(status: 0)
             }
@@ -97,10 +97,19 @@ actor OpenCodeProvider: UsageProvider {
         }
     }
 
-    private func fetch(token: String) async throws -> Data {
-        var request = URLRequest(url: OpenCodeUsage.endpoint)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    static func endpoint(for credential: OpenCodeCredentials.Credential) -> URL {
+        credential.oauth
+            ? URL(string: "https://opencode.ai/inference/go/v1/usage")!
+            : OpenCodeUsage.endpoint
+    }
+
+    private func fetch(_ credential: OpenCodeCredentials.Credential) async throws -> Data {
+        var request = URLRequest(url: Self.endpoint(for: credential))
+        request.setValue("Bearer \(credential.token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let org = credential.org {
+            request.setValue(org, forHTTPHeaderField: "x-opencode-org-id")
+        }
         request.timeoutInterval = 15
 
         Log.usage.debug("GET opencode.ai/zen/go/v1/usage")
@@ -111,7 +120,20 @@ actor OpenCodeProvider: UsageProvider {
         // Upstream serves a missing Go plan as 401 through the same branch as
         // a bad key (its join finds no plan row either way). Both read as
         // "nothing readable here", and the settings row says how to connect.
-        if status == 401 { throw UsageProviderError.needsAuth }
+        if status == 401 {
+            if Self.isExpiredAPIKey(data) {
+                throw UsageProviderError.nothingMetered(
+                    L10n.t("This OpenCode key has expired. Create a new key in the OpenCode console"))
+            }
+            if credential.oauth, await signedIn(credential) {
+                throw UsageProviderError.nothingMetered(
+                    L10n.t("No OpenCode Go subscription on this account"))
+            }
+            if let expires = credential.expires, expires <= Date() {
+                throw UsageProviderError.credentialExpired
+            }
+            throw UsageProviderError.needsAuth
+        }
         // A valid key that is not entitled to Go: readable, but metering
         // nothing — not an error, and it must not be shown as one.
         if status == 403 {
@@ -129,6 +151,28 @@ actor OpenCodeProvider: UsageProvider {
             throw UsageProviderError.badResponse(status: status)
         }
         return data
+    }
+
+    static func isExpiredAPIKey(_ data: Data) -> Bool {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = root["error"] as? [String: Any] else { return false }
+        return error["code"] as? String == "api_key_expired"
+    }
+
+    private func signedIn(_ credential: OpenCodeCredentials.Credential) async -> Bool {
+        let console = credential.console ?? URL(string: "https://opencode.ai/console")!
+        guard var parts = URLComponents(url: console.appendingPathComponent("api/user"),
+                                        resolvingAgainstBaseURL: false) else { return false }
+        parts.query = nil
+        guard let url = parts.url else { return false }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(credential.token)", forHTTPHeaderField: "Authorization")
+        if let org = credential.org {
+            request.setValue(org, forHTTPHeaderField: "x-opencode-org-id")
+        }
+        request.timeoutInterval = 15
+        guard let (_, response) = try? await session.data(for: request) else { return false }
+        return (response as? HTTPURLResponse)?.statusCode == 200
     }
 
     /// How long to wait after a 429 — a minute, doubling per consecutive

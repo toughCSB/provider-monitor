@@ -136,6 +136,7 @@ final class ClaudeOAuthProviderTests: XCTestCase {
     private func makeProvider(source: CredentialSource,
                               cli: ClaudeUsageCLI? = nil,
                               cliRefreshInterval: TimeInterval = 5 * 60,
+                              endpointReuseInterval: TimeInterval = 0,
                               profile: ClaudeProfile = .default(),
                               desktopCache: ClaudeDesktopUsageCache? = nil,
                               desktopFreshness: TimeInterval = 30 * 60,
@@ -162,6 +163,7 @@ final class ClaudeOAuthProviderTests: XCTestCase {
                                    loadCredentials: { try source.read() },
                                    cli: cli,
                                    cliRefreshInterval: cliRefreshInterval,
+                                   endpointReuseInterval: endpointReuseInterval,
                                    desktopCache: desktopCache,
                                    desktopFreshness: desktopFreshness,
                                    desktopRescanInterval: desktopRescanInterval)
@@ -198,6 +200,45 @@ final class ClaudeOAuthProviderTests: XCTestCase {
         XCTAssertEqual(snapshot.windows.map(\.id), ["session", "weekly_all"])
         XCTAssertEqual(source.reads, 0, "the keychain was read even though the CLI answered")
         XCTAssertEqual(StubEndpoint.requestCount, 0, "the endpoint was called even though the CLI answered")
+    }
+
+    func testWeeklyOnlyCLIKeepsAnEmptySessionHeadlineWithoutEndpointFallback() async throws {
+        StubEndpoint.reset([.init(status: 200, body: Self.usagePayload)])
+        let source = CredentialSource(readable: true)
+        let provider = makeProvider(source: source, cli: Self.cli(answering:
+            "Current week (all models): 4% used"))
+
+        let snapshot = try await provider.fetchSnapshot()
+
+        XCTAssertEqual(snapshot.windows.map(\.id), ["weekly_all"])
+        XCTAssertEqual(snapshot.headlineID, "session")
+        XCTAssertEqual(snapshot.weeklyID, "weekly_all")
+        XCTAssertEqual(source.reads, 0)
+        XCTAssertEqual(StubEndpoint.requestCount, 0)
+    }
+
+    func testEndpointReusesNormalResponseWithOriginalMeasurementTime() async throws {
+        StubEndpoint.reset([.init(status: 200, body: Self.usagePayload)])
+        let provider = makeProvider(source: CredentialSource(readable: true), endpointReuseInterval: 90)
+
+        let first = try await provider.fetchSnapshot()
+        let second = try await provider.fetchSnapshot()
+
+        XCTAssertEqual(StubEndpoint.requestCount, 1)
+        XCTAssertEqual(first.observation?.measuredAt, second.observation?.measuredAt)
+        XCTAssertEqual(second.observation?.source, .remote)
+    }
+
+    func testConcurrentEndpointCallsShareOneRequest() async throws {
+        StubEndpoint.reset([.init(status: 200, body: Self.usagePayload, delay: 0.1)])
+        let provider = makeProvider(source: CredentialSource(readable: true))
+
+        async let first = provider.fetchSnapshot()
+        async let second = provider.fetchSnapshot()
+        let (firstReading, secondReading) = try await (first, second)
+
+        XCTAssertEqual(StubEndpoint.requestCount, 1)
+        XCTAssertEqual(firstReading.observation?.measuredAt, secondReading.observation?.measuredAt)
     }
 
     /// A CLI that cannot answer is a reason to ask the endpoint, never a reason
@@ -541,6 +582,7 @@ private final class StubEndpoint: URLProtocol {
     struct Answer {
         let status: Int
         var body: Data = Data()
+        var delay: TimeInterval = 0
     }
 
     private static let lock = NSLock()
@@ -575,13 +617,20 @@ private final class StubEndpoint: URLProtocol {
 
     override func startLoading() {
         let answer = Self.next()
-        let response = HTTPURLResponse(url: request.url!,
-                                       statusCode: answer.status,
-                                       httpVersion: "HTTP/1.1",
-                                       headerFields: ["Content-Type": "application/json"])!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: answer.body)
-        client?.urlProtocolDidFinishLoading(self)
+        let respond = { [self] in
+            let response = HTTPURLResponse(url: request.url!,
+                                           statusCode: answer.status,
+                                           httpVersion: "HTTP/1.1",
+                                           headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: answer.body)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+        if answer.delay > 0 {
+            DispatchQueue.global().asyncAfter(deadline: .now() + answer.delay, execute: respond)
+        } else {
+            respond()
+        }
     }
 
     override func stopLoading() {}

@@ -48,11 +48,14 @@ actor AntigravityProvider: UsageProvider {
     /// nothing a test can arrange, and the ordering this fixes is exactly what
     /// would otherwise go uncovered.
     private let localQuotaOverride: (@Sendable () async -> [LimitWindow]?)?
+    nonisolated private let headlineModel: @Sendable () -> AntigravityHeadlineModel
 
     init(session: URLSession = .shared,
-         localQuota: (@Sendable () async -> [LimitWindow]?)? = nil) {
+         localQuota: (@Sendable () async -> [LimitWindow]?)? = nil,
+         headlineModel: @escaping @Sendable () -> AntigravityHeadlineModel = { Preferences.storedAntigravityHeadlineModel() }) {
         self.session = session
         self.localQuotaOverride = localQuota
+        self.headlineModel = headlineModel
         self.localSession = URLSession(configuration: .ephemeral,
                                        delegate: LocalhostTrust(),
                                        delegateQueue: nil)
@@ -176,10 +179,11 @@ actor AntigravityProvider: UsageProvider {
     /// the ring onto the other family's window — a real reading of the wrong
     /// thing, which is the one outcome worth going out of the way to avoid.
     nonisolated func resolveHeadlineID(for windows: [LimitWindow], cadence: RingCadence) -> String {
+        if windows.count == 1, windows[0].id == "requests" { return "requests" }
         let preferredLimit = cadence
-        let preferredModel = Preferences.storedAntigravityHeadlineModel()
+        let preferredModel = headlineModel()
         let modelCandidates = windows.filter { $0.id.hasPrefix(preferredModel.rawValue) }
-        let candidates = modelCandidates.isEmpty ? windows : modelCandidates
+        let candidates = modelCandidates
 
         if preferredLimit != .automatic {
             let limitCandidates = candidates.filter { matches($0, cadence: preferredLimit) }
@@ -229,21 +233,23 @@ actor AntigravityProvider: UsageProvider {
         windows.isEmpty ? nil : resolveHeadlineID(for: windows, cadence: cadence)
     }
 
-    /// Both cadences Antigravity's lanes actually cover, and never a third it
-    /// does not have. Asked of the provider rather than worked out from the
-    /// windows alone, because each cadence arrives as two lanes — one per model
-    /// family — and a rule that insists on a single answer finds none.
+    /// Only cadences for the selected model family may be offered. Returning
+    /// automatic when that family is absent also stops the store from deriving
+    /// misleading choices from the other family's windows.
     nonisolated func ringCadences(in windows: [LimitWindow]) -> [RingCadence]? {
+        let model = headlineModel().rawValue
         let offered = RingCadence.allCases.filter { cadence in
-            cadence != .automatic && windows.contains { matches($0, cadence: cadence) }
+            cadence != .automatic && windows.contains {
+                $0.id.hasPrefix(model) && matches($0, cadence: cadence)
+            }
         }
-        return offered.isEmpty ? nil : offered
+        return offered.isEmpty ? [.automatic] : offered
     }
 
     nonisolated func resolveWeeklyID(for windows: [LimitWindow]) -> String? {
-        let preferredModel = Preferences.storedAntigravityHeadlineModel()
+        let preferredModel = headlineModel()
         let modelCandidates = windows.filter { $0.id.hasPrefix(preferredModel.rawValue) }
-        let candidates = modelCandidates.isEmpty ? windows : modelCandidates
+        let candidates = modelCandidates
         let weekly = candidates.filter { window in
             window.duration == 7 * 86400 ||
                 window.id.lowercased().hasSuffix("-weekly") ||

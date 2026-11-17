@@ -481,12 +481,16 @@ struct ProviderSnapshot: Identifiable, Equatable {
     /// dashes.
     var resetSummaryIDs: [String] {
         guard kind == .usage, !windows.isEmpty else { return [] }
+        // An explicit missing headline is not permission to count down another
+        // model family's window. Its rows remain visible in the detailed list.
+        if headlineID != nil && headline == nil { return [] }
         var ids: [String] = []
         if let lead = windows.first(where: { $0.id == headlineID }) ?? windows.first(where: { $0.resetsAt != nil }) {
             ids.append(lead.id)
         }
         let shortID = cadenceWindows[.fiveHour]
-            ?? HeadlineWindow.window(answering: .fiveHour, in: windows, weeklyID: weeklyID)?.id
+            ?? ((offeredCadences.isEmpty || offeredCadences.contains(.fiveHour))
+                ? HeadlineWindow.window(answering: .fiveHour, in: windows, weeklyID: weeklyID)?.id : nil)
         if let shortID, !ids.contains(shortID) {
             ids.append(shortID)
         }

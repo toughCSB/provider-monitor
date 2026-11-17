@@ -340,25 +340,22 @@ final class RingCadenceStoreTests: XCTestCase {
 /// Antigravity answers the request itself, because its lanes are split by model
 /// family as well as by cadence and the shared rule cannot see the family.
 final class AntigravityCadenceTests: XCTestCase {
-    /// Ids that name neither family on purpose. The model choice is read from
-    /// the machine's own preferences, so a test that used `gemini-…` would be
-    /// asserting against whatever the developer happened to have selected; with
-    /// neither prefix present the provider falls back to every lane, and the
-    /// cadence is the only variable left.
+    /// Fix the selected family explicitly; an unknown family must no longer
+    /// borrow another model's limits just to test cadence selection.
     private let lanes = [
-        LimitWindow(id: "lane-hourly", label: "5 hour", usedFraction: 0.3, duration: 5 * 3600),
-        LimitWindow(id: "lane-weekly", label: "Weekly", usedFraction: 0.5, duration: 7 * 86400)
+        LimitWindow(id: "gemini-hourly", label: "5 hour", usedFraction: 0.3, duration: 5 * 3600),
+        LimitWindow(id: "gemini-weekly", label: "Weekly", usedFraction: 0.5, duration: 7 * 86400)
     ]
 
-    private let provider = AntigravityProvider()
+    private let provider = AntigravityProvider(headlineModel: { .gemini })
 
     func testAutomaticKeepsTheMostConstrainedLane() {
-        XCTAssertEqual(provider.resolveHeadlineID(for: lanes), "lane-weekly")
+        XCTAssertEqual(provider.resolveHeadlineID(for: lanes), "gemini-weekly")
     }
 
     func testAChosenCadenceMovesTheRingToThatLane() {
-        XCTAssertEqual(provider.resolveHeadlineID(for: lanes, cadence: .fiveHour), "lane-hourly")
-        XCTAssertEqual(provider.resolveHeadlineID(for: lanes, cadence: .weekly), "lane-weekly")
+        XCTAssertEqual(provider.resolveHeadlineID(for: lanes, cadence: .fiveHour), "gemini-hourly")
+        XCTAssertEqual(provider.resolveHeadlineID(for: lanes, cadence: .weekly), "gemini-weekly")
     }
 
     /// Nothing Antigravity reports is metered by the month, so the ring stays on
@@ -372,7 +369,7 @@ final class AntigravityCadenceTests: XCTestCase {
     /// What the store asks, and what the settings row offers: the two have to
     /// agree, so a lane the menu names is one the ring can be pointed at.
     func testTheProviderAnswersTheStoresQuestion() {
-        XCTAssertEqual(provider.resolveRingWindow(in: lanes, cadence: .weekly), "lane-weekly")
+        XCTAssertEqual(provider.resolveRingWindow(in: lanes, cadence: .weekly), "gemini-weekly")
         XCTAssertNil(provider.resolveRingWindow(in: [], cadence: .weekly))
     }
 

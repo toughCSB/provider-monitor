@@ -55,6 +55,10 @@ actor ClaudeOAuthProvider: UsageProvider {
     /// How many 429s in a row. The endpoint answers `Retry-After: 0`, which is
     /// no guidance at all, so the wait doubles each time instead.
     private var consecutiveRateLimits = 0
+    /// Keep the original observation when a normal response is reused.
+    private var lastEndpoint: (snapshot: ProviderSnapshot, at: Date, token: String, accountID: String?)?
+    private var endpointFetch: (token: String, accountID: String?, task: Task<ProviderSnapshot, Error>)?
+    private let endpointReuseInterval: TimeInterval
 
     private let archive: UsageArchive
     /// How this profile's token is obtained. Injected for the same reason
@@ -111,11 +115,13 @@ actor ClaudeOAuthProvider: UsageProvider {
          loadCredentials: (@Sendable () throws -> ClaudeCredentials)? = nil,
          cli: ClaudeUsageCLI? = ClaudeUsageCLI.locate(),
          cliRefreshInterval: TimeInterval = 60,
+         endpointReuseInterval: TimeInterval = 90,
          desktopCache: ClaudeDesktopUsageCache? = ClaudeDesktopUsageCache(),
          desktopFreshness: TimeInterval = 60,
          desktopRescanInterval: TimeInterval = 5 * 60) {
         self.cli = cli
         self.cliRefreshInterval = cliRefreshInterval
+        self.endpointReuseInterval = endpointReuseInterval
         self.desktopCache = desktopCache
         self.desktopFreshness = desktopFreshness
         self.desktopRescanInterval = desktopRescanInterval
@@ -178,8 +184,31 @@ actor ClaudeOAuthProvider: UsageProvider {
             Log.usage.debug("skipping fetch, backing off for \(remaining, format: .fixed(precision: 0))s")
             throw UsageProviderError.rateLimited(retryAfter: remaining)
         }
+        if keychain.isAskingAgain {
+            credentials = nil
+            lastEndpoint = nil
+        }
+        let token = try currentToken()
+        let accountID = usageAccountID
+        let now = Date()
+        if let last = lastEndpoint, last.token == token, last.accountID == accountID,
+           now.timeIntervalSince(last.at) < endpointReuseInterval,
+           !Self.hasExpiredWindow(last.snapshot.windows, at: now) {
+            return last.snapshot
+        }
+        if let endpointFetch, endpointFetch.token == token,
+           endpointFetch.accountID == accountID {
+            return try await endpointFetch.task.value
+        }
+        let task = Task { try await self.fetch(retryingOnUnauthorized: true) }
+        endpointFetch = (token, accountID, task)
+        defer {
+            if endpointFetch?.token == token && endpointFetch?.accountID == accountID {
+                endpointFetch = nil
+            }
+        }
         do {
-            let snapshot = try await fetch(retryingOnUnauthorized: true)
+            let snapshot = try await task.value
             retryNoEarlierThan = nil
             consecutiveRateLimits = 0
             archive.saveBackoffUntil(nil, providerID: id)
@@ -193,9 +222,11 @@ actor ClaudeOAuthProvider: UsageProvider {
             // itself on every failed tick, so its own window never expired and
             // the keychain was never read again.
             credentials = nil
+            lastEndpoint = nil
             throw UsageProviderError.needsAuth
         } catch UsageProviderError.credentialExpired {
             credentials = nil
+            lastEndpoint = nil
             throw UsageProviderError.credentialExpired
         } catch let error as UsageProviderError {
             if case .rateLimited(let retryAfter) = error {
@@ -394,8 +425,11 @@ actor ClaudeOAuthProvider: UsageProvider {
                 L10n.t("Claude answered, but listed no usage limits for this account. Some Enterprise and team plans don't report them.")
             )
         }
-        return snapshot(windows: windows, plan: credentials?.subscriptionType,
-                        observation: UsageObservation(measuredAt: Date(), source: .remote))
+        let measuredAt = Date()
+        let result = snapshot(windows: windows, plan: credentials?.subscriptionType,
+                              observation: UsageObservation(measuredAt: measuredAt, source: .remote))
+        lastEndpoint = (result, measuredAt, token, usageAccountID)
+        return result
     }
 
     private func currentToken() throws -> String {
