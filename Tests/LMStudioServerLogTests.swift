@@ -375,4 +375,22 @@ final class LMStudioLogTailTests: XCTestCase {
         try append(LMStudioLogFixtures.openAIWithoutDrafts, to: "2026-09/2026-09-11.1.log")
         XCTAssertEqual(tail.poll().compactMap { if case .prediction(let p) = $0 { return p.outputTokens } else { return nil } }, [171])
     }
+
+    func testPollingSeesNewMonthsNumericRotationAndRemovalWithoutRescanningHistory() throws {
+        try write(LMStudioLogFixtures.openAI, to: "2026-09/2026-09-10.9.log")
+        let tail = LMStudioLogTail(directory: directory, timeZone: LMStudioLogFixtures.zone)
+        _ = tail.loadHistory()
+        let october = directory.appendingPathComponent("2026-10")
+        try FileManager.default.createDirectory(at: october, withIntermediateDirectories: true)
+        XCTAssertTrue(tail.poll().isEmpty, "an empty new month must not hide the previous log")
+        XCTAssertEqual(tail.file?.lastPathComponent, "2026-09-10.9.log")
+        try write(LMStudioLogFixtures.nativeV1, to: "2026-10/2026-10-01.9.log")
+        try write(LMStudioLogFixtures.nativeV1, to: "2026-10/2026-10-01.10.log")
+        XCTAssertFalse(tail.poll().isEmpty)
+        XCTAssertEqual(tail.file?.lastPathComponent, "2026-10-01.10.log")
+        XCTAssertTrue(tail.poll().isEmpty, "unchanged bytes are not counted twice")
+        try FileManager.default.removeItem(at: october)
+        _ = tail.poll()
+        XCTAssertEqual(tail.file?.lastPathComponent, "2026-09-10.9.log")
+    }
 }

@@ -285,7 +285,8 @@ struct LMStudioServerLog {
 
 /// The server log as one stream: every file that exists, then whatever the
 /// newest one grows by. LM Studio opens a new file each day and a new index
-/// when it restarts, so "the newest file" is re-found on every poll.
+/// when it restarts, so "the newest file" is re-found on every poll without
+/// listing the contents of older months.
 final class LMStudioLogTail {
     private let directory: URL
     private let timeZone: TimeZone
@@ -319,6 +320,27 @@ final class LMStudioLogTail {
         }
     }
 
+    /// Polls need only the last file, not a sorted index of all history. Still
+    /// inspect directory names each time so rotation, deletion and a new month
+    /// are observed immediately; a cache of the winning path would miss them.
+    private static func newestLog(in directory: URL) -> URL? {
+        let fm = FileManager.default
+        let months = ((try? fm.contentsOfDirectory(atPath: directory.path)) ?? [])
+            .filter { !$0.hasPrefix(".") }.sorted(by: >)
+        for month in months {
+            let folder = directory.appendingPathComponent(month)
+            let names = ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? [])
+                .filter { $0.hasSuffix(".log") }
+            if let newest = names.max(by: { a, b in
+                let (da, ia) = split(a), (db, ib) = split(b)
+                return da == db ? ia < ib : da < db
+            }) {
+                return folder.appendingPathComponent(newest)
+            }
+        }
+        return nil
+    }
+
     private static func split(_ name: String) -> (String, Int) {
         let parts = name.dropLast(".log".count).split(separator: ".", maxSplits: 1)
         return (String(parts.first ?? ""), parts.count > 1 ? Int(parts[1]) ?? 0 : 0)
@@ -350,7 +372,7 @@ final class LMStudioLogTail {
     /// Whatever was written since the last look.
     func poll() -> [LMStudioServerLog.Event] {
         var events: [LMStudioServerLog.Event] = []
-        guard let newest = Self.logFiles(in: directory).last else { return events }
+        guard let newest = Self.newestLog(in: directory) else { return events }
         if newest != file {
             events += parser.finish()
             parser = LMStudioServerLog(timeZone: timeZone)
