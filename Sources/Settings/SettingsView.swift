@@ -154,12 +154,6 @@ struct SettingsView: View {
     @State private var accountRegistrationError: String?
     @State private var displays: [DisplayOption] = []
     @State private var selection: SettingsSection = .accounts
-    /// The provider being dragged right now.
-    ///
-    /// Held here rather than read off the drop, because the rows have to move
-    /// *during* the drag and `dropDestination` only hands over its payload once
-    /// the pointer is released. See `DragState` for why it is a reference.
-    @State private var drag = DragState()
     /// Bumped on every drop, purely to make the rows' cursor rects re-evaluate.
     ///
     /// A re-render per drop, which is a discrete action and cheap — unlike the
@@ -549,10 +543,9 @@ struct SettingsView: View {
                                switchAccount: switchAccount, retry: retry,
                                refresh: { usageStore?.reevaluate(providerID: $0) },
                                isOrderable: true,
-                               drag: drag,
                                cursorRefresh: cursorRefresh,
                                onDrop: { cursorRefresh += 1 },
-                               takePlaceOf: { move($0, onto: account.id) },
+                               reorder: { move($0, relativeTo: account.id, after: $1) },
                                didConnect: { connect(account.id) })
                 }
                 if connected.isEmpty {
@@ -584,10 +577,9 @@ struct SettingsView: View {
                                    switchAccount: switchAccount, retry: retry,
                                    refresh: { usageStore?.reevaluate(providerID: $0) },
                                    isOrderable: false,
-                                   drag: drag,
                                    cursorRefresh: cursorRefresh,
                                    onDrop: {},
-                                   takePlaceOf: { _ in false },
+                                   reorder: { _, _ in false },
                                    didConnect: { connect(account.id) })
                     }
                     // Says what switching one back on will do, which is the
@@ -1240,28 +1232,18 @@ struct SettingsView: View {
         preferences.setProviderOrder(ids)
     }
 
-    /// Put the dragged provider where the one under the pointer sits, while the
-    /// drag is still in the air.
-    ///
-    /// Written through the preference on every crossing rather than batched
-    /// until the drop: a drag released outside the window fires no drop at all,
-    /// and a list left visibly reordered but unsaved would disagree with the
-    /// notch until the window was next opened.
-    ///
-    /// Returns whether both ids are ours — anything dragged in from another app
-    /// is a string too.
-    @discardableResult
-    private func move(_ movedID: String, onto targetID: String) -> Bool {
-        guard let from = accounts.firstIndex(where: { $0.id == movedID }),
-              let to = accounts.firstIndex(where: { $0.id == targetID })
+    private func move(_ movedID: String, relativeTo targetID: String, after: Bool) -> Bool {
+        let activeIDs = Set(connected.map(\.id))
+        guard activeIDs.contains(movedID), activeIDs.contains(targetID),
+              let source = accounts.firstIndex(where: { $0.id == movedID }),
+              let target = accounts.firstIndex(where: { $0.id == targetID })
         else { return false }
-        guard from != to else { return true }
+        guard source != target else { return true }
 
-        var reordered = accounts
-        reordered.insert(reordered.remove(at: from), at: to)
-        accounts = reordered
-        // Every row, connected or not — the order is a fact about the list, and
-        // a provider switched off today still has a place to come back to.
+        let insertion = target + (after ? 1 : 0) - (source < target ? 1 : 0)
+        guard insertion != source else { return true }
+        let moved = accounts.remove(at: source)
+        accounts.insert(moved, at: insertion)
         preferences.setProviderOrder(accounts.map(\.id))
         return true
     }
@@ -1330,17 +1312,6 @@ private struct GrabCursor: NSViewRepresentable {
             addCursorRect(bounds, cursor: .openHand)
         }
     }
-}
-
-/// What is being dragged, shared by every row without any of them observing it.
-///
-/// A class on purpose. As `@State`/`@Binding` this was SwiftUI state, so setting
-/// it re-rendered every row twice per drag — once to start, once to finish — and
-/// the second rebuild arrived after the drop and reset the pointer. A plain
-/// reference is read the same way and changes nothing on screen.
-@MainActor
-final class DragState {
-    var id: String?
 }
 
 /// A compact macOS-style colour choice. The outer ring makes pale colours and
@@ -1430,16 +1401,13 @@ private struct AccountRow: View {
     /// The provider in flight, shared with every other row: this one has to
     /// know what is being dragged the moment the pointer arrives, not once it
     /// is released.
-    let drag: DragState
     /// Changes on every drop; handed straight to `GrabCursor`, which uses the
     /// change itself rather than the value.
     let cursorRefresh: Int
     /// Tells the list a drop landed, so the cursor rects get re-evaluated while
     /// the pointer is still standing on the grip.
     let onDrop: () -> Void
-    /// Move the dragged provider into this row's place. False when the id is
-    /// not one of ours.
-    let takePlaceOf: (String) -> Bool
+    let reorder: (String, Bool) -> Bool
     /// Called after this row is switched on, so the list can decide where it
     /// now belongs. The row itself cannot: it can see only itself.
     let didConnect: () -> Void
@@ -1449,6 +1417,8 @@ private struct AccountRow: View {
     /// The handle only appears under the pointer, so a row at rest stays as
     /// quiet as it was before there was anything to drag.
     @State private var isHovering = false
+    @State private var rowHeight: CGFloat = 0
+    @State private var isDropTarget = false
 
     private var isConnected: Bool { preferences.isConnected(provider.id) }
     private var isMuted: Bool { preferences.isMutedAlerts(for: provider.id) }
@@ -1476,16 +1446,8 @@ private struct AccountRow: View {
                 // Without this only the drawn pixels are grabbable, and the
                 // gaps between the three of them are not.
                 .contentShape(Rectangle())
-                // `onDrag` rather than `draggable`, for its one advantage: it
-                // runs a closure when the drag *starts*. Every other row needs
-                // to know what is coming before it can make room for it, and
-                // `dropDestination` does not hand over its payload until the
-                // drop.
                 .onDrag {
-                    // A row with no ring has nothing to place. Handing back an
-                    // empty provider is how `onDrag` declines a drag.
                     guard isOrderable else { return NSItemProvider() }
-                    drag.id = provider.id
                     return NSItemProvider(object: provider.id as NSString)
                 } preview: {
                     // The name alone, not the row: dragging the switch, the
@@ -1617,32 +1579,22 @@ private struct AccountRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        // The whole row is the drop target, handle or not: a 12pt strip is a
-        // hard thing to hit, and there is no ambiguity about which row the
-        // pointer is over.
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
-        .dropDestination(for: String.self) { ids, _ in
-            defer { drag.id = nil }
-            guard isOrderable else { return false }
-            // AppKit resets the cursor when a drag session ends and will not ask
-            // what belongs here again until the mouse next moves — so releasing
-            // the button and holding still left an arrow on a grip that was
-            // perfectly grabbable. Setting a cursor by hand loses that race
-            // whatever the timing, because the reset lands last; asking AppKit
-            // to re-evaluate the rects does not race it at all.
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { rowHeight = $0 }
+        .background {
+            if isDropTarget {
+                RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.14))
+            }
+        }
+        .dropDestination(for: String.self) { ids, location in
+            guard isOrderable, let moved = ids.first else { return false }
             onDrop()
-            // The list already settled on the way in. This only answers whether
-            // what was released was ever ours.
-            guard let moved = ids.first else { return false }
-            return takePlaceOf(moved)
+            // Reordering on hover moves the targets and makes a cancelled drag
+            // change the saved order. The drop lands against a stable layout.
+            return reorder(moved, location.y >= rowHeight / 2)
         } isTargeted: { entered in
-            // The rearrangement happens here, not on the drop: the pointer
-            // crossing into this row is the whole gesture, and the rows sliding
-            // out of the way is what says where the ring will land.
-            guard isOrderable, entered, let moved = drag.id, moved != provider.id
-            else { return }
-            withAnimation(.snappy(duration: 0.22)) { _ = takePlaceOf(moved) }
+            isDropTarget = isOrderable && entered
         }
     }
 
@@ -1659,7 +1611,7 @@ private struct AccountRow: View {
             // stayed gone until the pointer left the row and came back. Dimming
             // cannot fail that way — the worst a stale `isHovering` costs now
             // is a little emphasis.
-            .opacity(isHovering ? 1 : (reduceTransparency ? 0.7 : 0.4))
+            .opacity(isHovering ? 1 : 0.75)
             // Tall enough to be part of a real target rather than a 13pt strip
             // floating in the middle of the row.
             .frame(width: 12, height: 22)

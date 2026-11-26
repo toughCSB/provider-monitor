@@ -1,6 +1,6 @@
 [package]
 name = "codenotch"
-version = "1.18.5"
+version = "1.18.6"
 edition = "2021"
 description = "Provider Monitor for Windows — usage notch for coding assistant providers"
 license = "MIT"

@@ -32,6 +32,13 @@ enum ReleaseNotes {
     static var all: [ReleaseNote] {
         [
             ReleaseNote(
+                version: "1.18.6",
+                headline: L10n.t("Drag providers to reorder the notch."),
+                changes: [
+                    .init(title: L10n.t("Provider order saves when you drop the row on Mac and Windows."))
+                ]
+            ),
+            ReleaseNote(
                 version: "1.18.5",
                 headline: L10n.t("Windows account and provider controls."),
                 changes: [
