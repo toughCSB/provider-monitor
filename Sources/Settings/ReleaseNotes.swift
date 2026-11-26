@@ -32,6 +32,14 @@ enum ReleaseNotes {
     static var all: [ReleaseNote] {
         [
             ReleaseNote(
+                version: "1.18.5",
+                headline: L10n.t("Windows account and provider controls."),
+                changes: [
+                    .init(title: L10n.t("Windows reads usage from matching codex-auth accounts.")),
+                    .init(title: L10n.t("Confirm provider visibility and drag to reorder on Windows."))
+                ]
+            ),
+            ReleaseNote(
                 version: "1.18.4",
                 headline: L10n.t("More reliable account readings with less background work."),
                 changes: [

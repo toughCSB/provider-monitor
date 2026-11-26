@@ -1,6 +1,9 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "Windows account and provider controls.": {"extractionState":"manual","localizations":{"ko":{"stringUnit":{"state":"translated","value":"Windows의 계정 조회와 프로바이더 설정을 개선했습니다."}}}},
+    "Windows reads usage from matching codex-auth accounts.": {"extractionState":"manual","localizations":{"ko":{"stringUnit":{"state":"translated","value":"Windows에서 연결된 codex-auth 계정의 사용량을 읽습니다."}}}},
+    "Confirm provider visibility and drag to reorder on Windows.": {"extractionState":"manual","localizations":{"ko":{"stringUnit":{"state":"translated","value":"Windows에서 확인 후 프로바이더를 추가·삭제하고 드래그로 순서를 바꿉니다."}}}},
     "More reliable account readings with less background work.": {"extractionState":"manual","localizations":{"ko":{"stringUnit":{"state":"translated","value":"계정별 사용량을 더 정확히 읽고 불필요한 작업을 줄였습니다."}}}},
     "Accurate quota readings": {"extractionState":"manual","localizations":{"ko":{"stringUnit":{"state":"translated","value":"정확한 사용량 표시"}}}},
     "Weekly-only Claude plans, model-specific Antigravity limits, and current OpenCode logins are handled without substituting another account or model.": {"extractionState":"manual","localizations":{"ko":{"stringUnit":{"state":"translated","value":"Claude의 주간 한도와 Antigravity 모델별 수치를 정확히 구분하고, OpenCode의 새 로그인 방식을 지원합니다."}}}},

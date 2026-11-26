@@ -250,31 +250,28 @@
   .p-dot{width:7px;height:7px;border-radius:4px;flex:0 0 auto}
   .p-tick{width:12px;flex:0 0 auto;color:#fff;font-size:11px}
 
-  /* Notch providers — the picker's rows again, ticked rather than chosen */
-  .np-list{margin-top:12px}
-  .np-row{margin:0;padding:8px 0;border-bottom:1px solid var(--row-rule)}
-  .np-row:last-child{border-bottom:0}
-  .np-line{display:flex;align-items:center;gap:6px}
-  .np-line .p-item{
-    flex:1 1 auto;min-width:0;margin:0;padding:4px 2px;background:transparent;border:0;border-radius:6px;
-  }
-  .np-line .p-item:hover{background:rgba(255,255,255,.07)}
-  .np-line .p-item.on{background:transparent;border:0}
-  .np-ag{display:flex;align-items:center;gap:8px;margin:6px 0 0 29px;font-size:11px;color:#808080}
-  .np-right{margin-left:auto;display:flex;align-items:center;gap:8px;white-space:nowrap;min-width:0}
-  .np-right .p-status{margin-left:0}
-  .np-lock{font-size:10px;color:#808080;font-style:italic}
-  .p-item.lock{cursor:default}
-  /* Up/down reorder buttons — the pill and the tray both draw providers in this order */
-  .np-move{display:flex;flex-direction:column;flex:0 0 auto;gap:2px}
-  .np-arrow{
-    background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.10);border-radius:5px;color:#d1d1d6;font:inherit;
-    font-size:10px;line-height:1;width:20px;height:15px;padding:0;cursor:pointer;
-    display:flex;align-items:center;justify-content:center;
-  }
-  .np-arrow:hover{border-color:#3f3f3f;color:#e8e8ea}
-  .np-arrow:disabled{opacity:.3;cursor:default}
-  .np-arrow:disabled:hover{border-color:#2e2e2e;color:#b0b0b3}
+  .np-list{margin-top:12px;display:grid;gap:7px}
+  .np-row{padding:8px 10px;border:1px solid #55565b;border-radius:9px;background:#34353a}
+  .np-row.active{border-color:#397865;background:#263f39}
+  .np-row.drop-before{box-shadow:0 -3px #69d9b5}
+  .np-row.drop-after{box-shadow:0 3px #69d9b5}
+  .np-line{display:flex;align-items:center;gap:8px;min-width:0}
+  .np-line .p-label{flex:1;font-weight:600}
+  .np-ag{display:flex;align-items:center;gap:8px;margin:6px 0 0 30px;font-size:11px;color:#c0c0c5}
+  .np-state{font-size:11px;color:#cccdd2;white-space:nowrap}
+  .active .np-state{color:#a6f2d7}
+  .np-message{color:#c8c9ce;font-size:11px;margin:4px 0 0 30px}
+  .np-grip{display:grid;place-items:center;width:22px;height:26px;background:none;border:0;color:#a6f2d7;font-size:18px;cursor:grab;padding:0}
+  .np-grip:active{cursor:grabbing}
+  .np-grip[hidden]{display:none}
+  .np-action{margin:0;white-space:nowrap}
+  .np-action:disabled{opacity:.55}
+  #notch-confirm{max-width:min(360px,calc(100vw - 42px));color:#f5f5f7;background:#29292b;border:1px solid #66666a;border-radius:13px;padding:19px}
+  #notch-confirm::backdrop{background:rgba(0,0,0,.48)}
+  #notch-confirm h2{margin:0;font-size:16px}
+  #notch-confirm p{color:#c7c7cc;font-size:13px}
+  .np-confirm-actions{display:flex;justify-content:flex-end;gap:8px}
+  #notch-confirm-apply{background:#176653;border-color:#4aa98e;color:#fff}
 
   /* Notch size */
   .c-scale{display:flex;align-items:center;gap:10px;margin-top:12px}
@@ -288,7 +285,7 @@
 
   /* The remaining editor controls are Windows-specific, but sit in the same soft
      grouped surfaces as the macOS settings instead of the old black web dashboard. */
-  .mode,.chip,.p-item,.np-arrow,.btn{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.10)}
+  .mode,.chip,.p-item,.btn{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.10)}
   .mode:hover,.chip:hover,.p-item:hover,.btn:hover{background:rgba(255,255,255,.11);border-color:rgba(255,255,255,.16)}
   .mode.on,.chip.on,.p-item.on{background:rgba(10,132,255,.22);border-color:var(--selection);color:#fff}
   #canvas,.truthstrip{background:rgba(20,20,22,.55);border-color:rgba(255,255,255,.09)}
@@ -443,14 +440,24 @@
     <!-- APPEARANCE / Notch ---------------------------------------------------------------- -->
     <section class="pane" id="pane-notch" role="tabpanel" aria-labelledby="tab-notch" tabindex="0" hidden>
       <h1 class="p-title">Accounts</h1>
-      <p class="p-lede">Connected providers appear in this order. Change each ring's period without affecting the others.</p>
+      <p class="p-lede">Choose which providers appear in the notch and set the order of their rings.</p>
 
       <div class="block first">
-        <div class="b-head">Connected</div>
-        <div class="b-sub">Click a provider to show or hide its ring. Use the arrows to change the order.</div>
+        <div class="b-head">Notch providers</div>
+        <div class="b-sub">Use Add or Remove to change visibility. Drag a handle to reorder active providers.</div>
         <div class="np-list" id="notch-list"></div>
         <div class="c-note dim" id="notch-note" style="margin-top:6px"></div>
       </div>
+      <dialog id="notch-confirm" aria-labelledby="notch-confirm-title" aria-describedby="notch-confirm-detail">
+        <form method="dialog">
+          <h2 id="notch-confirm-title"></h2>
+          <p id="notch-confirm-detail"></p>
+          <div class="np-confirm-actions">
+            <button class="btn" value="cancel" autofocus>Cancel</button>
+            <button class="btn" id="notch-confirm-apply" value="apply"></button>
+          </div>
+        </form>
+      </dialog>
       <div class="block">
         <div class="b-head">Managed accounts</div>
         <div class="b-sub">Add up to two Codex and two Claude accounts. Each login uses the official CLI in private app storage. Your usual CLI login stays untouched.</div>
@@ -739,8 +746,14 @@ const KO_STATIC = {
   'Add up to two Codex and two Claude accounts. Each login uses the official CLI in private app storage. Your usual CLI login stays untouched.':'Codex와 Claude 계정을 각각 최대 두 개 등록할 수 있습니다. 공식 CLI가 앱 전용 공간에서 로그인하며 평소 CLI 계정은 그대로 유지됩니다.',
   'Advanced · Existing account directories':'고급 · 기존 계정 폴더',
   'Legacy profile monitoring. Register an existing signed-in folder only if you already use this setup.':'기존 프로필 모니터링입니다. 이미 사용 중인 로그인 폴더가 있을 때만 연결하세요.',
-  'Connected providers appear in this order. Change each ring\'s period without affecting the others.':'연결된 프로바이더가 이 순서대로 표시됩니다. 다른 링에는 영향을 주지 않고 각 링의 기간을 바꿀 수 있습니다.',
-  'Click a provider to show or hide its ring. Use the arrows to change the order.':'프로바이더를 클릭하여 링을 표시하거나 숨깁니다. 화살표로 순서를 바꿉니다.',
+  'Choose which providers appear in the notch and set the order of their rings.':'노치에 표시할 프로바이더와 링 순서를 정합니다.',
+  'Use Add or Remove to change visibility. Drag a handle to reorder active providers.':'추가·삭제 버튼으로 표시 여부를 바꿉니다. 활성 프로바이더의 손잡이를 끌어 순서를 바꿀 수 있습니다.',
+  'Notch providers':'노치에 표시할 프로바이더', 'Active':'활성', 'Inactive':'비활성',
+  'Add provider?':'프로바이더를 추가할까요?', 'Remove provider?':'프로바이더를 삭제할까요?',
+  'will appear at the end of the notch.':'프로바이더가 노치의 맨 뒤에 표시됩니다.',
+  'will be hidden from the notch.':'프로바이더의 링을 노치에서 숨깁니다.',
+  'Drag to reorder. With the keyboard, use Up, Down, Home, or End.':'끌어서 이동합니다. 키보드에서는 위·아래 화살표와 Home·End 키를 사용합니다.',
+  'Remove':'삭제', 'Add':'추가', 'Cancel':'취소',
   'The notch and taskbar icon use the same readings. Adjust what stays visible and how large it is.':'노치와 트레이 아이콘은 같은 측정값을 사용합니다. 무엇을 계속 표시할지와 크기를 정합니다.',
   'The edge surface with one ring per provider. Turning it off does not stop usage monitoring.':'화면 가장자리에 프로바이더별 링을 표시합니다. 꺼도 사용량 모니터링은 계속됩니다.',
   'Keep the notch above every other window, including full-screen apps.':'전체 화면 앱을 포함한 다른 모든 창 위에 노치를 유지합니다.',
@@ -842,7 +855,7 @@ const STATUS_TEXT = {
 };
 let uiLang = 'en';
 const STATIC_DICTS = { zh:ZH_STATIC, ja:JA_STATIC, ko:KO_STATIC, ru:RU_STATIC, uk:UK_STATIC };
-function ui(key, fallback){ const d = STATIC_DICTS[uiLang]; return (d && d[key]) || fallback; }
+function ui(key, fallback = key){ const d = STATIC_DICTS[uiLang]; return (d && d[key]) || fallback; }
 function applyStaticUi(){
   const dict = STATIC_DICTS[uiLang] || null;
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
@@ -1308,122 +1321,171 @@ function notchOn(){
   const on = notchSlots.filter(sl => sl && ids.indexOf(sl.provider) >= 0);
   return on.length ? on : ids.map(id => ({ provider:id }));
 }
-function notchSlotOf(id){
-  for(const sl of notchOn()){ if(sl.provider === id) return sl; }
-  return null;
-}
-
-/* Every provider, in the order the pill would actually draw them: the ones that are on, in their
-   saved order (떡배님's ask — the notch and the tray both draw providers in whatever order this
-   list is saved in), then any switched-off ones after, in their usual order — reordering only
-   ever concerns what is actually showing. */
-function notchDisplayOrder(){
-  const list = providerList();
-  const onIds = notchOn().map(sl => sl.provider);
-  const onSet = new Set(onIds);
-  const byId = id => list.find(p => p.id === id);
-  return onIds.map(byId).filter(Boolean).concat(list.filter(p => !onSet.has(p.id)));
-}
+const notchList = document.getElementById('notch-list');
+const notchConfirm = document.getElementById('notch-confirm');
+let notchPending = null;
+let notchSaving = false;
+let notchDragging = null;
+let notchTarget = null;
 
 function renderNotch(){
-  const host = document.getElementById('notch-list');
-  const note = document.getElementById('notch-note');
-  if(!host || !note) return;
+  // Keep the insertion target mounted if account data arrives during a drag.
+  if(notchDragging) return;
+  const list = providerList();
   const on = notchOn();
-  const onIds = on.map(sl => sl.provider);
-  let html = '';
-  for(const p of notchDisplayOrder()){
-    const sl = notchSlotOf(p.id);
-    const ticked = !!sl;
-    const only = ticked && on.length === 1;     // the last one standing: it cannot be unticked
-    const st = statusText(p);                   // the tray picker's words: "not signed in", etc.
-    const idx = onIds.indexOf(p.id);
-    const moveHtml = ticked
-      ? '<span class="np-move">'
-        + '<button class="np-arrow" data-up="' + esc(p.id) + '"' + (idx <= 0 ? ' disabled' : '')
-        + ' aria-label="' + esc(ui('Move up', 'Move up')) + '" title="' + esc(ui('Move up', 'Move up')) + '">&#9650;</button>'
-        + '<button class="np-arrow" data-down="' + esc(p.id) + '"' + (idx < 0 || idx >= onIds.length - 1 ? ' disabled' : '')
-        + ' aria-label="' + esc(ui('Move down', 'Move down')) + '" title="' + esc(ui('Move down', 'Move down')) + '">&#9660;</button>'
-        + '</span>'
-      : '';
-    html += '<div class="np-row"><div class="np-line">'
-      + '<button class="p-item' + (ticked ? ' on' : '') + (only ? ' lock' : '') + '"'
-      + ' data-np="' + esc(p.id) + '" role="checkbox" aria-checked="' + ticked + '">'
-      + '<span class="p-tick">' + (ticked ? '&#10003;' : '') + '</span>'
+  const onIds = new Set(on.map(slot => slot.provider));
+  const display = [
+    ...on.map(slot => list.find(p => p.id === slot.provider)).filter(Boolean),
+    ...list.filter(p => !onIds.has(p.id))
+  ];
+  notchList.innerHTML = display.map(p => {
+    const active = onIds.has(p.id);
+    const only = active && on.length === 1;
+    const id = esc(p.id);
+    const state = active ? 'Active' : 'Inactive';
+    const action = active ? 'Remove' : 'Add';
+    const grip = ui('Drag to reorder. With the keyboard, use Up, Down, Home, or End.');
+    const status = statusText(p);
+    return '<div class="np-row' + (active ? ' active' : '') + '" data-np-row="' + id + '">'
+      + '<div class="np-line"><button type="button" class="np-grip" data-np-grip="' + id
+      + '" draggable="true" aria-label="' + esc((p.label || p.id) + ' · ' + grip) + '" title="' + esc(grip)
+      + '"' + (active && on.length > 1 ? '' : ' hidden') + '>&#8942;&#8942;</button>'
       + '<span class="p-label">' + esc(p.label || p.id) + '</span>'
-      + '<span class="np-right">'
-      + (st ? '<span class="p-status warn">' + esc(st) + '</span>' : '')
-      + (only ? '<span class="np-lock">' + esc(ui('kept', 'kept')) + '</span>' : '')
-      + '</span></button>'
-      + moveHtml
+      + '<span class="np-state">' + esc(ui(state)) + '</span>'
+      + '<button type="button" class="btn np-action" data-np-action="' + id + '"'
+      + (only || notchSaving ? ' disabled' : '') + '>' + esc(ui(action)) + '</button></div>'
+      + (status ? '<p class="np-message">' + esc(status) + '</p>' : '')
+      + limitPicker(p.id, ringLimits[p.id] || 'weekly', active)
+      + (p.id === 'gemini' ? agPicker('model', ui('Model data'), AG_MODELS, agPrefs.model, active) : '')
       + '</div>';
-    html += limitPicker(p.id, ringLimits[p.id] || 'weekly', ticked);
-    if(p.id === 'gemini'){
-      html += agPicker('model', ui('Model data', 'Model data'), AG_MODELS, agPrefs.model, ticked);
-    }
-    html += '</div>';
-  }
-  host.innerHTML = html;
-  note.textContent = ui('Showing', 'Showing') + ' ' + on.map(sl => provLabel(sl.provider)).join(', ')
-    + '. ' + ui('One provider always stays ticked, so the pill is never empty.', 'One provider always stays ticked, so the pill is never empty.');
+  }).join('');
+  document.getElementById('notch-note').textContent =
+    ui('One provider always stays ticked, so the pill is never empty.');
 }
 
-/* Everything ticked, in exactly today's canonical order, is stored as an EMPTY list rather than as
-   an explicit one. Empty means "all, in whatever order is canonical" to the Rust side, so a
-   provider added in a future version turns up on the notch by itself. A custom order is never
-   collapsed this way — only a list that is genuinely equivalent to "all of them" is, so
-   reordering (moveNotch) is never silently lost the next time every provider happens to be on. */
-function saveNotch(next){
+/* An empty list represents all providers in canonical order. Retain explicit
+   custom orders even when every provider is visible. */
+async function saveNotch(next, focusId, control){
+  if(notchSaving) return;
   const ids = providerList().map(p => p.id);
-  const isCanonicalAll = next.length === ids.length && next.every((sl, i) => sl.provider === ids[i]);
-  const store = isCanonicalAll ? [] : next;
-  const prev = notchSlots;
-  notchSlots = store;
-  renderNotch();
-  invoke('set_notch_slots', { slots: store.map(sl => ({ provider:sl.provider })) })
-    .then(() => toast(ui('Saved', 'Saved')))
-    .catch(e => {
-      notchSlots = prev;     // nothing was saved, so put it back rather than show a lie
-      renderNotch();
-      strip('set_notch_slots failed: ' + errText(e));
-    });
-}
-
-function toggleNotch(id){
-  const ids = providerList().map(p => p.id);
-  if(ids.indexOf(id) < 0) return;
-  let on = notchOn().slice();      // keeps whatever order (custom or canonical) is already saved
-  const at = on.findIndex(sl => sl.provider === id);
-  if(at >= 0){
-    /* Unticking the last one is refused rather than saved. An empty list means "all" everywhere
-       below this window, so saving one would switch every provider back on — the opposite of what
-       the click asked for. Holding the last tick is the only unambiguous answer. */
-    if(on.length <= 1){ toast(ui('At least one provider stays on the notch', 'At least one provider stays on the notch')); return; }
-    on.splice(at, 1);
-  } else {
-    on.push({ provider:id });      // a provider switched back on joins the end, not an old position
+  const canonical = next.length === ids.length && next.every((slot, i) => slot.provider === ids[i]);
+  const store = canonical ? [] : next;
+  notchSaving = true;
+  try{
+    await invoke('set_notch_slots', { slots: store.map(slot => ({ provider:slot.provider })) });
+    notchSlots = store;
+    toast(ui('Saved'));
+  }catch(e){
+    strip('set_notch_slots failed: ' + errText(e));
+  }finally{
+    notchSaving = false;
+    renderNotch();
+    focusNotch(focusId, control);
   }
-  saveNotch(on);
 }
 
-/* Reorders one provider by one place among the ones that are on — 떡배님's ask: which icon comes
-   first on the pill (and the tray) is its own setting, not fixed. */
-function moveNotch(id, dir){
-  const on = notchOn().slice();
-  const at = on.findIndex(sl => sl.provider === id);
-  const to = at + dir;
-  if(at < 0 || to < 0 || to >= on.length) return;
-  const tmp = on[at]; on[at] = on[to]; on[to] = tmp;
-  saveNotch(on);
+function focusNotch(id, control){
+  notchList.querySelectorAll('[data-np-' + control + ']').forEach(button => {
+    if(button.getAttribute('data-np-' + control) === id && !button.disabled) button.focus();
+  });
 }
 
-document.getElementById('notch-list').addEventListener('click', e => {
-  const up = e.target.closest('[data-up]');
-  if(up){ moveNotch(up.dataset.up, -1); return; }
-  const down = e.target.closest('[data-down]');
-  if(down){ moveNotch(down.dataset.down, 1); return; }
-  const b = e.target.closest('[data-np]');
-  if(b) toggleNotch(b.dataset.np);
+function askNotchChange(id){
+  if(notchSaving || notchConfirm.open || !providerList().some(p => p.id === id)) return;
+  const on = notchOn();
+  const remove = on.some(slot => slot.provider === id);
+  if(remove && on.length === 1) return;
+  notchPending = { id, remove };
+  notchConfirm.returnValue = 'cancel';
+  document.getElementById('notch-confirm-title').textContent = ui(remove ? 'Remove provider?' : 'Add provider?');
+  document.getElementById('notch-confirm-detail').textContent = provLabel(id) + ' · '
+    + ui(remove ? 'will be hidden from the notch.' : 'will appear at the end of the notch.');
+  document.getElementById('notch-confirm-apply').textContent = ui(remove ? 'Remove' : 'Add');
+  notchConfirm.showModal();
+}
+
+notchConfirm.addEventListener('close', () => {
+  const pending = notchPending;
+  notchPending = null;
+  if(!pending) return;
+  const { id, remove } = pending;
+  const on = notchOn();
+  const present = on.some(slot => slot.provider === id);
+  if(notchConfirm.returnValue !== 'apply' || present !== remove
+     || (remove && on.length === 1) || !providerList().some(p => p.id === id)){
+    focusNotch(id, 'action');
+    return;
+  }
+  const next = remove ? on.filter(slot => slot.provider !== id) : [...on, {provider:id}];
+  saveNotch(next, id, 'action');
+});
+
+function reorderNotch(id, target, after){
+  if(id === target || notchSaving) return;
+  const on = notchOn();
+  const source = on.find(slot => slot.provider === id);
+  if(!source) return;
+  const next = on.filter(slot => slot !== source);
+  const at = next.findIndex(slot => slot.provider === target);
+  if(at < 0) return;
+  next.splice(at + Number(after), 0, source);
+  if(next.some((slot, i) => slot !== on[i])) saveNotch(next, id, 'grip');
+}
+
+function clearNotchTarget(){
+  notchTarget?.row.classList.remove('drop-before', 'drop-after');
+  notchTarget = null;
+}
+
+notchList.addEventListener('click', e => {
+  const button = e.target.closest('[data-np-action]');
+  if(button) askNotchChange(button.dataset.npAction);
+});
+notchList.addEventListener('dragstart', e => {
+  const grip = e.target.closest('[data-np-grip]');
+  if(!grip || notchSaving){ e.preventDefault(); return; }
+  notchDragging = grip.dataset.npGrip;
+  e.dataTransfer.setData('text/plain', notchDragging);
+  e.dataTransfer.effectAllowed = 'move';
+});
+notchList.addEventListener('dragover', e => {
+  if(!notchDragging) return;
+  const row = e.target.closest('.np-row.active');
+  const id = row?.dataset.npRow;
+  clearNotchTarget();
+  if(!row || id === notchDragging) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  const box = row.getBoundingClientRect();
+  const after = e.clientY >= box.top + box.height / 2;
+  notchTarget = {row, id, after};
+  row.classList.add(after ? 'drop-after' : 'drop-before');
+});
+notchList.addEventListener('dragleave', e => {
+  if(notchTarget && !notchTarget.row.contains(e.relatedTarget)) clearNotchTarget();
+});
+notchList.addEventListener('drop', e => {
+  if(!notchDragging || !notchTarget) return;
+  e.preventDefault();
+  const id = notchDragging;
+  const {id:target, after} = notchTarget;
+  notchDragging = null;
+  clearNotchTarget();
+  reorderNotch(id, target, after);
+});
+notchList.addEventListener('dragend', () => {
+  notchDragging = null;
+  clearNotchTarget();
+});
+notchList.addEventListener('keydown', e => {
+  const grip = e.target.closest('[data-np-grip]');
+  if(!grip || !['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key)) return;
+  e.preventDefault();
+  const id = grip.dataset.npGrip;
+  const on = notchOn().map(slot => slot.provider);
+  const at = on.indexOf(id);
+  const target = { ArrowUp:on[at - 1], ArrowDown:on[at + 1], Home:on[0], End:on.at(-1) }[e.key];
+  if(target) reorderNotch(id, target, e.key === 'ArrowDown' || e.key === 'End');
 });
 document.getElementById('notch-list').addEventListener('change', e => {
   const ringBox = e.target.closest('[data-ring]');
@@ -1801,7 +1863,10 @@ function renderManaged(){
     box.querySelector('[data-part=identity]').textContent=identity
       ? mt('Account: ','계정: ')+identity.replace('\u001f',' · ')
       : mt('No managed account registered','등록된 관리 계정 없음');
-    const note=row?.snapshot?.note||'';
+    const rawNote=row?.snapshot?.note||'';
+    const note=rawNote==='codex-auth'
+      ? mt('Reading your existing codex-auth account','기존 codex-auth 계정에서 사용량을 읽고 있습니다')
+      : rawNote;
     box.querySelector('[data-part=status]').textContent=pending?.message||
       (row ? (row.disconnected?mt('Disconnected','연결 해제됨'):(note||row.snapshot?.status||mt('Waiting for usage','사용량 확인 대기'))) :
         mt('Use Add account to sign in with the official CLI.','계정 추가를 눌러 공식 CLI로 로그인하세요.'));

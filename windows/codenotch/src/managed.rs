@@ -28,6 +28,7 @@ static REFRESH: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static PERSIST_LOCK: Mutex<()> = Mutex::new(());
 static CODEX_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CLAUDE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CODEX_AUTH_REFRESH: Mutex<Option<CodexAuthRefresh>> = Mutex::new(None);
 
 fn generation_counter(provider: &str) -> &'static AtomicU64 {
     if provider == "codex" { &CODEX_GENERATION } else { &CLAUDE_GENERATION }
@@ -682,8 +683,135 @@ fn parse_codex_limits(value: &Value) -> Vec<LimitWindow> {
     windows
 }
 
+// The codex-auth registry resolves each account by email and workspace ID. The
+// active account can change independently of the registered monitor slots.
+fn codex_auth_account<'a>(registry: &'a Value, pinned: &str) -> Option<&'a Value> {
+    // The installed codex-auth 0.4 uses disk schema 4 and command schema 1.
+    if registry.get("schema_version")?.as_u64()? != 4 {
+        return None;
+    }
+    let mut matches = registry.get("accounts")?.as_array()?.iter().filter(|row| {
+        let email = row.get("email").and_then(Value::as_str).unwrap_or("").trim();
+        let workspace = row.get("chatgpt_account_id").and_then(Value::as_str).unwrap_or("").trim();
+        row.get("auth_mode").and_then(Value::as_str) == Some("chatgpt")
+            && !email.is_empty()
+            && !workspace.is_empty()
+            && pinned == format!("{}\u{1f}{}", email.to_lowercase(), workspace.to_lowercase())
+    });
+    let account = matches.next()?;
+    matches.next().is_none().then_some(account)
+}
+
+fn codex_auth_reading(account: &Value, now: u64) -> Option<UsageSnapshot> {
+    let fetched_at = account.get("last_usage_at")?.as_u64()?.checked_mul(1000)?;
+    if fetched_at == 0 || fetched_at > now || now - fetched_at >= POLL_SECS * 1000 {
+        return None;
+    }
+    codex_auth_windows(account.get("last_usage")?, fetched_at)
+}
+
+fn codex_auth_api_reading(reply: &Value, account: &Value, fetched_at: u64) -> Option<UsageSnapshot> {
+    if reply.get("schema_version")?.as_u64()? != 1 {
+        return None;
+    }
+    let key = account.get("account_key")?.as_str()?;
+    let email = account.get("email")?.as_str()?.trim().to_lowercase();
+    let mut rows = reply.get("accounts")?.as_array()?.iter().filter(|row| {
+        row.get("account_key").and_then(Value::as_str) == Some(key)
+            && row.get("email").and_then(Value::as_str).is_some_and(|s| s.trim().to_lowercase() == email)
+    });
+    let row = rows.next()?;
+    if rows.next().is_some() {
+        return None;
+    }
+    let usage = row.get("usage")?;
+    let refresh = usage.get("refresh")?;
+    if usage.get("source")?.as_str()? != "api"
+        || refresh.get("method")?.as_str()? != "api"
+        || refresh.get("status")?.as_str()? != "ok"
+    {
+        return None;
+    }
+    // The tool keeps updated_at unchanged when the API returns the same limits.
+    // A successful live reply still verifies those numbers at the current time.
+    codex_auth_windows(usage, fetched_at)
+}
+
+fn codex_auth_windows(data: &Value, fetched_at: u64) -> Option<UsageSnapshot> {
+    let windows: Vec<_> = ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|id| {
+            let window = data.get(id)?;
+            let used = window.get("used_percent")?.as_f64()?;
+            let duration = window.get("window_minutes").and_then(Value::as_f64);
+            Some(LimitWindow {
+                id: id.into(),
+                label: crate::codex::label_for(duration, id),
+                used: (used / 100.0).clamp(0.0, 1.0),
+                resets_at: window.get("resets_at").and_then(Value::as_u64).and_then(|s| s.checked_mul(1000)),
+                ..Default::default()
+            })
+        })
+        .collect();
+    (!windows.is_empty()).then_some(UsageSnapshot {
+        status: "ok".into(),
+        windows,
+        fetched_at,
+        note: "codex-auth".into(),
+        ..Default::default()
+    })
+}
+
+struct CodexAuthRefresh {
+    started: Instant,
+    fetched_at: u64,
+    reply: Option<Value>,
+}
+
+fn codex_auth_snapshot(pinned: &str) -> Option<UsageSnapshot> {
+    let home = crate::codex::codex_home()?;
+    let registry_path = home.join("accounts").join("registry.json");
+    let read_registry = || -> Option<Value> {
+        let file = fs::File::open(&registry_path).ok()?;
+        let mut bytes = Vec::new();
+        file.take(1_048_577).read_to_end(&mut bytes).ok()?;
+        (bytes.len() <= 1_048_576).then(|| serde_json::from_slice(&bytes).ok()).flatten()
+    };
+    // Both slots share the same CLI call. Read under the lock so a second slot
+    // can use the first slot's results immediately without starting a child.
+    let mut last = CODEX_AUTH_REFRESH.lock().unwrap();
+    let registry = read_registry()?;
+    let account = codex_auth_account(&registry, pinned)?;
+    if let Some(recent) = last.as_ref().filter(|refresh| refresh.started.elapsed() < Duration::from_secs(POLL_SECS)) {
+        return recent.reply.as_ref().and_then(|reply| codex_auth_api_reading(reply, account, recent.fetched_at))
+            .or_else(|| codex_auth_reading(account, now_ms()));
+    }
+    if let Some(usage) = codex_auth_reading(account, now_ms()) {
+        return Some(usage);
+    }
+    let exe = dirs::config_dir()?.join("npm").join("codex-auth.cmd");
+    if !exe.is_file() {
+        return None;
+    }
+    let mut cmd = command("codex", &exe, &home);
+    cmd.args(["list", "--api", "--json"]);
+    // codex-auth owns refresh and cache writes; the monitor never switches the
+    // active account and never copies a token from its registry or snapshots.
+    let started = Instant::now();
+    let reply = capture(cmd, Duration::from_secs(REQUEST_SECS)).ok();
+    let fetched_at = now_ms();
+    *last = Some(CodexAuthRefresh { started, fetched_at, reply });
+    let registry = read_registry()?;
+    let account = codex_auth_account(&registry, pinned)?;
+    last.as_ref()?.reply.as_ref().and_then(|reply| codex_auth_api_reading(reply, account, fetched_at))
+        .or_else(|| codex_auth_reading(account, fetched_at))
+}
+
 fn snapshot(provider: &str, dir: &Path, pinned: &str, old: &UsageSnapshot) -> UsageSnapshot {
     let result = if provider == "codex" {
+        if let Some(reading) = codex_auth_snapshot(pinned) {
+            return reading;
+        }
         rpc(dir, true).and_then(|(account, limits)| {
             let current = codex_identity(&account, dir).ok_or("Codex sign-in required")?;
             if current != pinned {
@@ -1384,6 +1512,46 @@ mod tests {
         let data=json!({"rateLimits":{"primary":{"usedPercent":12,"windowDurationSeconds":604800,"resetsAt":1800000000}}});
         assert_eq!(parse_codex_limits(&data)[0].label,"Weekly limit");
     }
+    #[test]
+    fn codex_auth_usage_is_pinned_to_the_account_and_does_not_require_it_to_be_active() {
+        let mut registry = json!({
+            "schema_version": 4,
+            "active_account_key": "first",
+            "accounts": [
+                {"account_key":"first","auth_mode":"chatgpt","email":"same@example.test","chatgpt_account_id":"other"},
+                {"account_key":"second","auth_mode":"chatgpt","email":"SAME@example.test","chatgpt_account_id":"workspace",
+                 "last_usage_at":1_800_000_000,"last_usage":{"primary":{"used_percent":25,"window_minutes":10080,"resets_at":1_800_010_000}}}
+            ]
+        });
+        let now = 1_800_000_001_000;
+        let pinned = "same@example.test\u{1f}workspace";
+        let row = codex_auth_account(&registry, pinned).unwrap();
+        let reading = codex_auth_reading(row, now).unwrap();
+        assert_eq!(reading.fetched_at, 1_800_000_000_000);
+        assert_eq!(reading.windows.len(), 1);
+        assert_eq!(reading.windows[0].label, "Weekly limit");
+        assert_eq!(reading.windows[0].used, 0.25);
+        assert_eq!(reading.windows[0].resets_at, Some(1_800_010_000_000));
+        assert!(codex_auth_reading(row, now + POLL_SECS * 1000).is_none());
+        assert!(codex_auth_reading(row, now - 2000).is_none());
+        let mut reply = json!({"schema_version":1,"accounts":[{
+            "account_key":"second","email":"same@example.test","usage":{
+                "source":"api","updated_at":1_700_000_000,
+                "refresh":{"method":"api","status":"ok"},
+                "primary":{"used_percent":25,"window_minutes":10080}
+            }
+        }]});
+        let live = codex_auth_api_reading(&reply, row, now).unwrap();
+        assert_eq!(live.fetched_at, now);
+        assert_eq!(live.windows[0].used, 0.25);
+        reply["accounts"][0]["usage"]["refresh"]["status"] = json!("http_error");
+        assert!(codex_auth_api_reading(&reply, row, now).is_none());
+        assert!(codex_auth_account(&registry, "different@example.test\u{1f}workspace").is_none());
+        let duplicate = row.clone();
+        registry["accounts"].as_array_mut().unwrap().push(duplicate);
+        assert!(codex_auth_account(&registry, pinned).is_none());
+    }
+
     #[test]
     fn account_identities_require_official_result_and_are_stable() {
         let dir =
