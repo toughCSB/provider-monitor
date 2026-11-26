@@ -163,6 +163,30 @@ fn jwt_claims(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&raw).ok()
 }
 
+/// Read identity metadata for the ordinary CLI home. Usage polling and activity
+/// detection share the home, but activity never uses the access token.
+pub(crate) fn activity_identity() -> Option<(String, u64)> {
+    let file = std::fs::File::open(auth_path()?).ok()?;
+    let modified = file.metadata().ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    let mut raw = Vec::new();
+    file.take(1_048_577).read_to_end(&mut raw).ok()?;
+    if raw.len() > 1_048_576 {
+        return None;
+    }
+    let auth: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    if auth.get("auth_mode").is_some_and(|mode| mode.as_str() != Some("chatgpt")) {
+        return None;
+    }
+    let tokens = auth.get("tokens")?;
+    let claims = jwt_claims(tokens.get("id_token")?.as_str()?)?;
+    let email = claims.get("email")?.as_str()?.trim().to_lowercase();
+    let workspace = tokens.get("account_id")?.as_str()?.trim().to_lowercase();
+    if email.is_empty() || workspace.is_empty() {
+        return None;
+    }
+    Some((format!("{email}\u{1f}{workspace}"), modified.as_millis() as u64))
+}
+
 /// Reads Codex's sign-in state; a missing file or missing field both mean "not signed in"
 fn load_credential() -> Option<Credential> {
     load_credential_in(&codex_home()?)

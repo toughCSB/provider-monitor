@@ -26,6 +26,26 @@ state.secondAccounts['codex-managed-2'].disconnected=true;
 assert.deepEqual(ids(),['claude'],'Hidden registered accounts must not expose the default CLI account');
 state.secondAccounts={};
 assert.deepEqual(ids(),['claude','codex'],'Only removing registration restores the legacy source');
+const activitySource = html.slice(html.indexOf('function workState('), html.indexOf('// Only Claude and Antigravity'));
+const workState = (id, activity) => vm.runInNewContext(activitySource+';workState(id)', {
+  id, activity, stateSnap: {agg:'idle'},
+});
+const enabledActivity = [{provider:'codex-managed-2',state:'busy'}];
+assert.equal(workState('codex-managed-2', enabledActivity), 'running');
+assert.equal(workState('codex-managed-1', enabledActivity), 'idle');
+assert.equal(workState('codex-managed-2', []), 'idle');
+const artwork = html.slice(html.indexOf('function updateRingArtwork('), html.indexOf('function renderRing('));
+const usageReading = {};
+let activityWrites = 0;
+const activityReading = {dataset:{},set innerHTML(value){this.markup=value;activityWrites++;}};
+const panel = {querySelector:selector=>selector==='.usage-reading'?usageReading:activityReading};
+vm.runInNewContext(artwork+`;updateRingArtwork(panel,'first','running');
+  updateRingArtwork(panel,'second','running');`, {panel,svgArc:()=>'<circle/>',RUNGREEN:'#28E07B'});
+assert.equal(usageReading.innerHTML,'second');
+assert.equal(activityWrites,1,'Refreshing usage must not restart an active rotation');
+assert.match(activityReading.markup,/class="arc-spin"/);
+vm.runInNewContext(artwork+`;updateRingArtwork(panel,'third','idle');`, {panel});
+assert.equal(activityReading.markup,'');
 for(const family of ['claude','codex']){
   const ctx={glyphs:{[family]:{kind:'svg',svg:'<svg fill="currentColor"><path fill="#D97757"/></svg>'}},
     BRAND_TINT:{codex:'#ffffff',claude:'#D97757'},uniqueSvgIds:s=>s};

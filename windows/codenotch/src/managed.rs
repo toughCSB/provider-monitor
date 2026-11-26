@@ -61,7 +61,7 @@ fn now_ms() -> u64 {
         .map(|x| x.as_millis() as u64)
         .unwrap_or(0)
 }
-fn id(provider: &str, slot: u8) -> String {
+pub(crate) fn id(provider: &str, slot: u8) -> String {
     format!("{provider}-managed-{slot}")
 }
 fn valid(provider: &str, slot: u8) -> bool {
@@ -702,6 +702,28 @@ fn codex_auth_account<'a>(registry: &'a Value, pinned: &str) -> Option<&'a Value
     matches.next().is_none().then_some(account)
 }
 
+fn read_codex_auth_registry(home: &Path) -> Option<Value> {
+    let file = fs::File::open(home.join("accounts").join("registry.json")).ok()?;
+    let mut bytes = Vec::new();
+    file.take(1_048_577).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 1_048_576 {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub(crate) fn codex_activity_slots(accounts: &[ManagedAccount]) -> Vec<(String, String, u8)> {
+    let Some(registry) = crate::codex::codex_home().and_then(|home| read_codex_auth_registry(&home)) else {
+        return Vec::new();
+    };
+    accounts.iter().filter_map(|account| {
+        let row = codex_auth_account(&registry, &account.identity)?;
+        let workspace = row.get("chatgpt_account_id")?.as_str()?.trim();
+        let user = row.get("chatgpt_user_id")?.as_str()?.trim();
+        (!workspace.is_empty() && !user.is_empty()).then(|| (workspace.into(), user.into(), account.slot))
+    }).collect()
+}
+
 fn codex_auth_reading(account: &Value, now: u64) -> Option<UsageSnapshot> {
     let fetched_at = account.get("last_usage_at")?.as_u64()?.checked_mul(1000)?;
     if fetched_at == 0 || fetched_at > now || now - fetched_at >= POLL_SECS * 1000 {
@@ -770,13 +792,7 @@ struct CodexAuthRefresh {
 
 fn codex_auth_snapshot(pinned: &str) -> Option<UsageSnapshot> {
     let home = crate::codex::codex_home()?;
-    let registry_path = home.join("accounts").join("registry.json");
-    let read_registry = || -> Option<Value> {
-        let file = fs::File::open(&registry_path).ok()?;
-        let mut bytes = Vec::new();
-        file.take(1_048_577).read_to_end(&mut bytes).ok()?;
-        (bytes.len() <= 1_048_576).then(|| serde_json::from_slice(&bytes).ok()).flatten()
-    };
+    let read_registry = || read_codex_auth_registry(&home);
     // Both slots share the same CLI call. Read under the lock so a second slot
     // can use the first slot's results immediately without starting a child.
     let mut last = CODEX_AUTH_REFRESH.lock().unwrap();

@@ -19,12 +19,14 @@
 //!     (the model can think for a long time between steps, hence the wide window).
 //!
 //! Polled every 2 s (upstream cadence), broadcast only on change. Cost discipline: database
-//! connections stay open, nothing is re-queried unless the file's mtime changed, the rollout tail
-//! is re-read only when its mtime changed, PowerShell runs only occasionally to find the network
+//! connections stay open, rollout tails are re-read only when their size or mtime changes,
+//! PowerShell runs only occasionally to find the network
 //! process pid, and the thread runs at lowered priority.
 
 use crate::AppState;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -64,15 +66,15 @@ fn mtime_ms(p: &std::path::Path) -> Option<u64> {
 /// Persistent connection + change gating: the query runs again only when the database file (or its
 /// -wal) changed mtime; otherwise the last result is reused. Cursor's state.vscdb is over 2 GB, and
 /// reopening it every 2 s for a table scan slowed the whole machine (typing lagged).
-struct DbCache {
+struct DbCache<T> {
     path: std::path::PathBuf,
     conn: Option<rusqlite::Connection>,
     sig: (u64, u64),
-    last: Vec<Activity>,
+    last: Vec<T>,
     checked_once: bool,
 }
 
-impl DbCache {
+impl<T: Clone> DbCache<T> {
     fn new(path: std::path::PathBuf) -> Self {
         Self { path, conn: None, sig: (0, 0), last: Vec::new(), checked_once: false }
     }
@@ -85,13 +87,17 @@ impl DbCache {
         (mtime_ms(&self.path).unwrap_or(0), mtime_ms(&wal).unwrap_or(0))
     }
     /// Calls f only when something changed (or on the first run); f returning None means the query failed → drop the connection and reopen next time
-    fn refresh<F: FnOnce(&rusqlite::Connection) -> Option<Vec<Activity>>>(&mut self, f: F) -> Vec<Activity> {
+    fn refresh<F: FnOnce(&rusqlite::Connection) -> Option<Vec<T>>>(&mut self, f: F) -> Vec<T> {
         let sig = self.signature();
         if self.checked_once && sig == self.sig {
             return self.last.clone();
         }
         self.sig = sig;
         self.checked_once = true;
+        self.query(f)
+    }
+
+    fn query<F: FnOnce(&rusqlite::Connection) -> Option<Vec<T>>>(&mut self, f: F) -> Vec<T> {
         if self.conn.is_none() {
             self.conn = open_ro(&self.path);
         }
@@ -110,15 +116,43 @@ impl DbCache {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum CodexWorkOwner {
+    CurrentCli,
+    Recorded(String, String),
+    Unknown,
+}
+
+impl CodexWorkOwner {
+    fn from_thread(source: &str, workspace: Option<String>, user: Option<String>) -> Self {
+        // A resumed terminal thread keeps its creator even if the CLI is now
+        // signed into another account. That creator does not own this turn.
+        if matches!(source, "cli" | "exec") {
+            return Self::CurrentCli;
+        }
+        match workspace.zip(user) {
+            Some((workspace, user)) => Self::Recorded(workspace, user),
+            None => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CodexWork {
+    owner: CodexWorkOwner,
+    event: Activity,
+    expires_at: u64,
+}
+
 /// Everything the probe thread keeps between ticks
 struct Ctx {
-    cursor: DbCache,
-    codex_turns: DbCache,
+    cursor: DbCache<Activity>,
+    codex_turns: DbCache<CodexWork>,
+    codex_desktop: DbCache<CodexWork>,
     codex_names: Option<rusqlite::Connection>,
-    rollout_path: Option<std::path::PathBuf>,
+    rollout_paths: Vec<RolloutSource>,
     rollout_checked_at: u64,
-    rollout_sig: u64,
-    rollout_last: Vec<Activity>,
+    rollouts: HashMap<PathBuf, CachedRollout>,
 }
 
 impl Ctx {
@@ -127,11 +161,11 @@ impl Ctx {
         Self {
             cursor: DbCache::new(crate::cursor::store_url().unwrap_or_default()),
             codex_turns: DbCache::new(home.join(".codex").join("thread_history_1.sqlite")),
+            codex_desktop: DbCache::new(home.join(".codex").join("sqlite").join("codex.db")),
             codex_names: None,
-            rollout_path: None,
+            rollout_paths: Vec::new(),
             rollout_checked_at: 0,
-            rollout_sig: 0,
-            rollout_last: Vec::new(),
+            rollouts: HashMap::new(),
         }
     }
 }
@@ -253,13 +287,13 @@ fn codex_last_step(text: &str) -> Option<(CodexStep, u64)> {
 /// The app maintains this turn table itself, which is far more reliable than a file mtime. Guard
 /// against "inProgress forever after a crash": no new item for the thread in the last 10 minutes
 /// (`thread_items.created_at_ms`) while the turn started more than 2 minutes ago → treated as stale.
-fn codex_turns_in_progress(ctx: &mut Ctx) -> Vec<Activity> {
+fn codex_turns_in_progress(ctx: &mut Ctx, account_bound: bool) -> Vec<CodexWork> {
     let now = now_ms();
     if ctx.codex_names.is_none() {
         ctx.codex_names = dirs::home_dir().and_then(|h| open_ro(&h.join(".codex").join("state_5.sqlite")));
     }
     let names = ctx.codex_names.as_ref();
-    ctx.codex_turns.refresh(|conn| {
+    let read = |conn: &rusqlite::Connection| {
         let mut stmt = conn
             .prepare("SELECT thread_id, started_at FROM thread_turns WHERE status = 'inProgress' ORDER BY started_at DESC LIMIT 8")
             .ok()?;
@@ -307,59 +341,315 @@ fn codex_turns_in_progress(ctx: &mut Ctx) -> Vec<Activity> {
             }
             let lt = last_type.unwrap_or_default().to_lowercase();
             let waiting = lt.contains("approval") || lt.contains("permission") || lt.contains("request_user");
-            out.push(Activity {
-                provider: "codex".into(),
-                state: if waiting { "waiting" } else { "busy" }.into(),
-                name,
-                detail: if waiting { "needs your input".into() } else { "Working".into() },
-                since: started_ms,
+            let owner = if account_bound {
+                names.and_then(|conn| conn.query_row(
+                    "SELECT source, creator_account_id, creator_user_id FROM threads WHERE id = ?1",
+                    [&thread_id], |row| Ok(CodexWorkOwner::from_thread(
+                        &row.get::<_, String>(0)?, row.get(1)?, row.get(2)?,
+                    )),
+                ).ok()).unwrap_or(CodexWorkOwner::Unknown)
+            } else { CodexWorkOwner::Unknown };
+            out.push(CodexWork {
+                owner,
+                expires_at: last.saturating_add(600_000).max(started_ms.saturating_add(120_000)),
+                event: Activity {
+                    provider: "codex".into(),
+                    state: if waiting { "waiting" } else { "busy" }.into(),
+                    name,
+                    detail: if waiting { "needs your input" } else { "Working" }.into(),
+                    since: started_ms,
+                },
             });
         }
         Some(out)
-    })
+    };
+    if account_bound { ctx.codex_turns.query(read) } else { ctx.codex_turns.refresh(read) }
+        .into_iter().filter(|work| work.expires_at >= now).collect()
 }
 
-fn codex_activity(ctx: &mut Ctx) -> Vec<Activity> {
-    // 1. The desktop app's real state
-    let turns = codex_turns_in_progress(ctx);
-    if !turns.is_empty() {
-        return turns;
+fn read_desktop_chats(conn: &rusqlite::Connection) -> Option<Vec<CodexWork>> {
+    let mut stmt = conn.prepare(
+        "SELECT account_id, user_id, MAX(observed_at_ms) FROM active_chat_turns
+         GROUP BY account_id, user_id ORDER BY MAX(observed_at_ms) DESC LIMIT 32",
+    ).ok()?;
+    let rows = stmt.query_map([], |row| {
+        let at: u64 = row.get(2)?;
+        Ok(CodexWork {
+            owner: CodexWorkOwner::Recorded(row.get(0)?, row.get(1)?),
+            expires_at: at.saturating_add(600_000),
+            event: Activity { provider: "codex".into(), state: "busy".into(), name: "Codex".into(),
+                              detail: "Working".into(), since: at },
+        })
+    }).ok()?;
+    Some(rows.flatten().collect())
+}
+
+fn route_codex_work(
+    work: Vec<CodexWork>, slots: &[(String, String, u8)],
+    accounts: &[crate::config::ManagedAccount], now: u64,
+) -> Vec<Activity> {
+    let mut events = Vec::new();
+    for work in work {
+        let CodexWorkOwner::Recorded(workspace, user) = work.owner else { continue };
+        if work.expires_at < now || work.event.since > now.saturating_add(60_000) {
+            continue;
+        }
+        let mut matches = slots.iter().filter(|(w, u, _)| w == &workspace && u == &user);
+        let Some((_, _, slot)) = matches.next() else { continue };
+        if matches.next().is_some() || !accounts.iter().any(|a| a.slot == *slot && !a.disconnected) {
+            continue;
+        }
+        let id = crate::managed::id("codex", *slot);
+        if !events.iter().any(|event: &Activity| event.provider == id) {
+            let mut event = work.event;
+            event.provider = id;
+            events.push(event);
+        }
     }
-    // 2. CLI / extension: locate the rollout every 30 s; skip the 256 KB tail read when its mtime has not changed
-    let now = now_ms();
-    if now.saturating_sub(ctx.rollout_checked_at) > 30_000 || ctx.rollout_path.is_none() {
+    events
+}
+
+struct RolloutSource {
+    path: PathBuf,
+    owner: CodexWorkOwner,
+}
+
+#[derive(Default)]
+struct CachedRollout {
+    signature: Option<(u64, u64)>,
+    step: Option<(CodexStep, u64)>,
+}
+
+fn read_indexed_rollouts(conn: &rusqlite::Connection) -> Vec<RolloutSource> {
+    let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT rollout_path, source, creator_account_id, creator_user_id FROM threads
+         WHERE archived = 0 ORDER BY updated_at_ms DESC LIMIT 16",
+    ) else { return vec![] };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok(RolloutSource {
+            path: PathBuf::from(row.get::<_, String>(0)?),
+            owner: CodexWorkOwner::from_thread(&row.get::<_, String>(1)?, row.get(2)?, row.get(3)?),
+        })
+    }) else { return vec![] };
+    rows.flatten().collect()
+}
+
+impl Ctx {
+    fn probe_rollouts(&mut self, now: u64) -> Vec<CodexWork> {
+        self.rollout_paths.iter().filter_map(|source| {
+            let signature = rollout_signature(&source.path)?;
+            let cached = self.rollouts.entry(source.path.clone()).or_default();
+            if Some(signature) != cached.signature {
+                cached.signature = Some(signature);
+                cached.step = crate::codex::tail_text(&source.path)
+                    .and_then(|text| codex_last_step(&text))
+                    .map(|(step, at)| (step, at.max(signature.0)));
+            }
+            let (step, at) = cached.step?;
+            if !codex_step_is_active(step, now.saturating_sub(at)) {
+                return None;
+            }
+            Some(CodexWork {
+                owner: source.owner.clone(),
+                expires_at: now,
+                event: Activity {
+                    provider: "codex".into(), state: "busy".into(), name: "Codex".into(),
+                    detail: "Working".into(), since: at,
+                },
+            })
+        }).collect()
+    }
+}
+
+fn codex_rollouts(ctx: &mut Ctx, now: u64) -> Vec<CodexWork> {
+    if now.saturating_sub(ctx.rollout_checked_at) >= 6_000 || ctx.rollout_paths.is_empty() {
         ctx.rollout_checked_at = now;
-        ctx.rollout_path = crate::codex::newest_rollout();
+        // Resumed sessions keep their original directory. Use the thread index as well
+        // as the date scan, which also covers a new session before its row is committed.
+        let mut paths = ctx.codex_names.as_ref().map(read_indexed_rollouts).unwrap_or_default();
+        if let Some(path) = crate::codex::newest_rollout() {
+            if !paths.iter().any(|source| source.path == path) {
+                paths.push(RolloutSource { path, owner: CodexWorkOwner::CurrentCli });
+            }
+        }
+        ctx.rollouts.retain(|path, _| paths.iter().any(|source| &source.path == path));
+        ctx.rollout_paths = paths;
     }
-    let Some(p) = ctx.rollout_path.clone() else { return vec![] };
-    let mtime = mtime_ms(&p).unwrap_or(0);
-    if mtime == ctx.rollout_sig {
-        // Content unchanged: only re-evaluate whether the silence has timed out
-        return ctx
-            .rollout_last
-            .iter()
-            .filter(|a| now.saturating_sub(a.since) <= 10 * 60_000)
-            .cloned()
-            .collect();
+    ctx.probe_rollouts(now)
+}
+
+fn rollout_signature(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let mtime = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    // A writer can extend a rollout without advancing its observed timestamp.
+    Some((mtime.as_millis() as u64, metadata.len()))
+}
+
+fn codex_step_is_active(step: CodexStep, quiet: u64) -> bool {
+    match step {
+        CodexStep::Tool => quiet <= 10 * 60_000,
+        CodexStep::Thinking => quiet <= 120_000,
+        CodexStep::AsstMsg => quiet <= 4_000,
+        CodexStep::Aborted => false,
     }
-    ctx.rollout_sig = mtime;
-    ctx.rollout_last.clear();
-    if let Some(text) = crate::codex::tail_text(&p) {
-        if let Some((step, ts)) = codex_last_step(&text) {
-            let at = ts.max(mtime);
-            let quiet = now.saturating_sub(at);
-            let busy = match step {
-                CodexStep::Tool => quiet <= 10 * 60_000,
-                CodexStep::Thinking => quiet <= 120_000,
-                CodexStep::AsstMsg => quiet <= 4_000,
-                CodexStep::Aborted => false,
-            };
-            if busy {
-                ctx.rollout_last = vec![Activity { provider: "codex".into(), state: "busy".into(), name: "Codex".into(), detail: "Working".into(), since: at }];
+}
+
+fn managed_codex_activity(
+    mut events: Vec<Activity>,
+    accounts: &[crate::config::ManagedAccount],
+    identity: &str,
+    signed_in_at: u64,
+) -> Vec<Activity> {
+    let mut matches = accounts.iter().filter(|account| account.identity == identity);
+    let Some(account) = matches.next() else { return vec![] };
+    if account.disconnected || matches.next().is_some() {
+        return vec![];
+    }
+    events.retain_mut(|event| {
+        if event.since < signed_in_at {
+            return false;
+        }
+        event.provider = crate::managed::id("codex", account.slot);
+        true
+    });
+    events
+}
+
+fn route_managed_codex_work(
+    work: Vec<CodexWork>,
+    slots: &[(String, String, u8)],
+    accounts: &[crate::config::ManagedAccount],
+    cli: Option<&(String, u64)>,
+    now: u64,
+) -> Vec<Activity> {
+    let (cli_work, other): (Vec<_>, Vec<_>) = work.into_iter().partition(|work| work.owner == CodexWorkOwner::CurrentCli);
+    let mut routed = route_codex_work(other, slots, accounts, now);
+    if let Some((identity, signed_in_at)) = cli {
+        let current = cli_work.into_iter()
+            .filter(|work| work.expires_at >= now && work.event.since >= *signed_in_at
+                && work.event.since <= now.saturating_add(60_000))
+            .max_by_key(|work| (work.event.state == "waiting", work.event.since))
+            .map(|work| work.event).into_iter().collect();
+        let remaining = managed_codex_activity(current, accounts, identity, *signed_in_at);
+        for event in remaining {
+            if !routed.iter().any(|other| other.provider == event.provider) {
+                routed.push(event);
             }
         }
     }
-    ctx.rollout_last.clone()
+    routed
+}
+
+#[cfg(test)]
+mod codex_activity_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_work_uses_both_account_fields_and_stops_on_removal() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE active_chat_turns(account_id TEXT, user_id TEXT, observed_at_ms INTEGER);
+             INSERT INTO active_chat_turns VALUES ('work','person',100), ('work','unrelated',100);",
+        ).unwrap();
+        let slots = vec![("work".into(), "person".into(), 2)];
+        let accounts = [crate::config::ManagedAccount {
+            provider: "codex".into(), slot: 2, directory: Default::default(),
+            identity: "work".into(), label: "Codex 2".into(), disconnected: false,
+        }];
+        let events = route_codex_work(read_desktop_chats(&db).unwrap(), &slots, &accounts, 200);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].provider, "codex-managed-2");
+        db.execute("DELETE FROM active_chat_turns WHERE user_id='person'", []).unwrap();
+        assert!(route_codex_work(read_desktop_chats(&db).unwrap(), &slots, &accounts, 201).is_empty());
+    }
+
+    #[test]
+    fn resumed_cli_rollout_outside_the_latest_days_uses_current_account() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("pm-resumed-rollout-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("rollout-resumed.jsonl");
+        let mut file = std::fs::File::create_new(&path).unwrap();
+        let now = now_ms();
+        let stamp = chrono::DateTime::from_timestamp_millis(now as i64).unwrap().to_rfc3339();
+        writeln!(file, r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"task_started"}}}}"#, stamp).unwrap();
+
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads(rollout_path TEXT, source TEXT, creator_account_id TEXT, creator_user_id TEXT,
+                                  archived INTEGER, updated_at_ms INTEGER);",
+        ).unwrap();
+        db.execute("INSERT INTO threads VALUES (?1, 'cli', 'work', 'owner', 0, ?2)",
+                   rusqlite::params![path.to_str().unwrap(), now as i64]).unwrap();
+
+        let mut ctx = Ctx::new();
+        ctx.rollout_paths = read_indexed_rollouts(&db);
+        let active = ctx.probe_rollouts(now);
+        assert_eq!(active.len(), 1);
+        let accounts = [1, 2].map(|slot| crate::config::ManagedAccount {
+            provider: "codex".into(), slot, directory: Default::default(),
+            identity: format!("account{slot}"), label: format!("Codex {slot}"), disconnected: false,
+        });
+        let slots = [("work".into(), "owner".into(), 2)];
+        let cli = (accounts[0].identity.clone(), now - 100);
+        let routed = route_managed_codex_work(active.clone(), &slots, &accounts, Some(&cli), now);
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].provider, "codex-managed-1");
+        assert_eq!(routed[0].state, "busy");
+        assert!(route_managed_codex_work(active, &slots, &accounts, None, now).is_empty());
+
+        writeln!(file, r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"task_complete"}}}}"#, stamp).unwrap();
+        assert!(ctx.probe_rollouts(now).is_empty());
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cli_work_animates_only_the_current_registered_account() {
+        let account = |slot, workspace| crate::config::ManagedAccount {
+            provider: "codex".into(), slot, directory: Default::default(),
+            identity: format!("same@example.test\u{1f}{workspace}"),
+            label: format!("Codex {slot}"), disconnected: false,
+        };
+        let mut accounts = [account(1, "personal"), account(2, "work")];
+        let events = vec![Activity {
+            provider: "codex".into(), state: "busy".into(), name: "Codex".into(),
+            detail: "Working".into(), since: 100,
+        }];
+        let current = accounts[1].identity.clone();
+        assert_eq!(managed_codex_activity(events.clone(), &accounts, &current, 50)[0].provider,
+                   "codex-managed-2");
+        assert!(managed_codex_activity(events.clone(), &accounts, &current, 101).is_empty());
+        assert!(managed_codex_activity(events.clone(), &accounts, "unknown", 50).is_empty());
+        accounts[1].disconnected = true;
+        assert!(managed_codex_activity(events, &accounts, &current, 50).is_empty());
+    }
+
+    #[test]
+    fn a_cached_assistant_message_expires_without_another_disk_write() {
+        assert!(codex_step_is_active(CodexStep::AsstMsg, 2_000));
+        assert!(!codex_step_is_active(CodexStep::AsstMsg, 4_001));
+        assert!(!codex_step_is_active(CodexStep::Thinking, 120_001));
+        assert!(!codex_step_is_active(CodexStep::Aborted, 0));
+    }
+
+    #[test]
+    fn a_rollout_append_invalidates_the_cache_even_at_the_same_mtime() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("pm-activity-signature-{}", std::process::id()));
+        let mut file = std::fs::File::create_new(&path).unwrap();
+        let times = std::fs::FileTimes::new().set_modified(SystemTime::now());
+        file.write_all(b"start\n").unwrap();
+        file.set_times(times).unwrap();
+        let before = rollout_signature(&path).unwrap();
+        file.write_all(b"complete\n").unwrap();
+        file.set_times(times).unwrap();
+        let after = rollout_signature(&path).unwrap();
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(before.0, after.0);
+        assert_ne!(before, after);
+    }
 }
 
 // ---------------- Claude desktop (cloud sessions): network-activity heuristic ----------------
@@ -527,14 +817,33 @@ fn presence() -> Presence {
     Presence { cursor: crate::cursor::present(), codex: crate::codex::present(), gemini: crate::antigravity::present() }
 }
 
-fn read_all(p: Presence, ctx: &mut Ctx) -> Vec<Activity> {
+fn read_all(p: Presence, ctx: &mut Ctx, accounts: &[crate::config::ManagedAccount]) -> Vec<Activity> {
     let mut all = Vec::new();
     all.extend(claude_activity());
     if p.cursor {
         all.extend(cursor_activity(ctx));
     }
     if p.codex {
-        all.extend(codex_activity(ctx));
+        let now = now_ms();
+        let managed = !accounts.is_empty();
+        let mut work = codex_turns_in_progress(ctx, managed);
+        if managed {
+            let slots = crate::managed::codex_activity_slots(accounts);
+            work.extend(ctx.codex_desktop.query(read_desktop_chats));
+            let before = crate::codex::activity_identity();
+            let has_cli_turn = work.iter().any(|work| work.owner == CodexWorkOwner::CurrentCli);
+            work.extend(codex_rollouts(ctx, now).into_iter().filter(|work| {
+                // Prefer the turn's start time and waiting status to the latest
+                // append time when the CLI has projected the turn into history.
+                !has_cli_turn || work.owner != CodexWorkOwner::CurrentCli
+            }));
+            let stable = before.filter(|before| crate::codex::activity_identity().as_ref() == Some(before));
+            all.extend(route_managed_codex_work(work, &slots, accounts, stable.as_ref(), now));
+        } else if !work.is_empty() {
+            all.extend(work.into_iter().map(|work| work.event));
+        } else if let Some(recent) = codex_rollouts(ctx, now).into_iter().max_by_key(|work| work.event.since) {
+            all.push(recent.event);
+        }
     }
     if p.gemini {
         all.extend(antigravity_activity());
@@ -600,7 +909,11 @@ pub fn start(app: AppHandle) {
                 pres = presence();
             }
             tick = tick.wrapping_add(1);
-            let found = read_all(pres, &mut ctx);
+            let accounts: Vec<_> = app.state::<AppState>().cfg.lock().unwrap().managed_accounts.iter()
+                .filter(|account| account.provider == "codex" && (1..=2).contains(&account.slot))
+                .cloned()
+                .collect();
+            let found = read_all(pres, &mut ctx, &accounts);
             if found != last {
                 // Log the first 20 state changes (with the Codex raw material) so thresholds can be calibrated
                 static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

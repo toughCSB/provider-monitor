@@ -439,7 +439,7 @@ function setUiLanguage(lang){
 let scalePct=100, scaleDragging=false, scaleT=null, scaleSaveT=null;
 // "Is it working?" per provider: Claude from the four-state engine, the others from the activity probe. Returns running | attention | idle
 function workState(id){
-  if(id.startsWith('claude-')||id.startsWith('codex-')) return 'idle'; // no account-bound activity source yet
+  if(id.startsWith('claude-')) return 'idle'; // no account-bound Claude activity source yet
   if(id==='claude'){
     if(stateSnap.agg==='running') return 'running';
     if(stateSnap.agg==='attention') return 'attention';
@@ -601,13 +601,26 @@ function svgArc(r,frac,color,width,extra=''){
     transform="rotate(-90 28 28)" ${extra}/>`;
 }
 
+function updateRingArtwork(svg, reading, state){
+  const usageReading=svg.querySelector('.usage-reading');
+  usageReading.innerHTML=reading;
+  const activityReading=svg.querySelector('.activity-reading');
+  // Keep the animation node attached while the account is still busy.
+  if(activityReading.dataset.state!==state){
+    activityReading.dataset.state=state;
+    activityReading.innerHTML=state==='running'
+      ? `<g class="arc-spin">${svgArc(19,0.28,RUNGREEN,2.5)}</g>`
+      : state==='attention' ? `<g class="arc-pulse"><circle cx="28" cy="28" r="19" fill="none" stroke="${AMBER}" stroke-width="2.5"/></g>` : '';
+  }
+}
+
 function renderRing(){
   const ps=providers();
   // Rebuild the DOM only when the structure changes (never swap the element under the cursor)
   const want=ps.map(p=>p.id+':'+p.name+':'+(glyphs[p.base||p.id]?glyphs[p.base||p.id].kind:'-')).join(',');
   if(pill.dataset.cells!==want){
     pill.innerHTML=ps.map(p=>`<div class="cell" data-p="${p.id}">
-      <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"></svg><div class="glyph ${(!glyphs[p.base||p.id]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div><span class="limit-badge"></span>${p.badge?`<span class="account-badge">${p.badge}</span>`:''}</div>
+      <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"><g class="usage-reading"></g><g class="activity-reading"></g></svg><div class="glyph ${(!glyphs[p.base||p.id]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div><span class="limit-badge"></span>${p.badge?`<span class="account-badge">${p.badge}</span>`:''}</div>
       <div class="pct">—</div></div>`).join('');
     pill.dataset.cells=want;
   }
@@ -624,13 +637,7 @@ function renderRing(){
     }
     let reading=`<circle cx="28" cy="28" r="22" fill="#2a2a2a"/><circle cx="28" cy="28" r="25" fill="none" stroke="${TRACK}" stroke-width="5"/>`;
     if(h && h.count==null) reading+=svgArc(25,ringPercent(h),tone(h.used),5);
-    let inner=`<g class="usage-reading">${reading}</g>`;
-    { // thin inner arc: spinning = working, amber pulse = waiting on you (one animation for all four, different sources)
-      const ws=workState(p.id);
-      if(ws==='running') inner+=`<g class="arc-spin">${svgArc(19,0.28,RUNGREEN,2.5)}</g>`;
-      else if(ws==='attention') inner+=`<g class="arc-pulse"><circle cx="28" cy="28" r="19" fill="none" stroke="${AMBER}" stroke-width="2.5"/></g>`;
-    }
-    svg.innerHTML=inner;
+    updateRingArtwork(svg, reading, workState(p.id));
     if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
     else if(h) pct.textContent=(h.derived?'~':'')+pctText(ringPercent(h))+'%';
     else pct.textContent=p.snap.windows.length?'—':'…'; // its declared window is missing: a dash, not a wait
